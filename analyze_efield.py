@@ -54,6 +54,31 @@ def get_charges_polarmace(atoms, calc):
     return calc.results['charges'].copy()
 
 
+def _polar_worker(args):
+    """Worker for multi-GPU PolarMACE. Each process owns one GPU."""
+    gpu_id, frame_indices, traj_path, bin_edges = args
+    device = f'cuda:{gpu_id}'
+    calc = get_polar_calc(device=device)
+    traj = Trajectory(str(traj_path))
+
+    results = []
+    for fi in frame_indices:
+        atoms = traj[fi]
+        symbols = atoms.get_chemical_symbols()
+        o_idx = [j for j, s in enumerate(symbols) if s == 'O']
+        com = atoms.positions[o_idx].mean(axis=0)
+
+        charges = get_charges_polarmace(atoms, calc)
+        _, efield = compute_efield_radial(atoms, charges, com, bin_edges)
+
+        o_charges = charges[[j for j, s in enumerate(symbols) if s == 'O']]
+        h_charges = charges[[j for j, s in enumerate(symbols) if s == 'H']]
+        results.append((efield, o_charges, h_charges))
+
+    traj.close()
+    return results
+
+
 def get_charges_fixed(atoms):
     """Return fixed SPC/E charges for each atom."""
     return np.array([Q_O_FIXED if s == 'O' else Q_H_FIXED
@@ -190,12 +215,8 @@ def main(traj_path, n_frames=100, skip_polar=False):
 
     bin_edges = np.linspace(0, r_max, NBINS + 1)
 
-    # Load PolarMACE if needed
-    polar_calc = None
-    if not skip_polar:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"  Loading PolarMACE (device={device})...")
-        polar_calc = get_polar_calc(device=device)
+    # Detect GPUs
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
     # Accumulate results
     all_efield_polar = []
@@ -205,6 +226,7 @@ def main(traj_path, n_frames=100, skip_polar=False):
     all_polar_charges_o = []
     all_polar_charges_h = []
 
+    # --- Fixed charges + density + orientational order (CPU, sequential) ---
     t0 = time.time()
     for idx, fi in enumerate(frame_indices):
         atoms = traj[fi]
@@ -212,37 +234,61 @@ def main(traj_path, n_frames=100, skip_polar=False):
         o_idx_frame = [j for j, s in enumerate(symbols) if s == 'O']
         com_frame = atoms.positions[o_idx_frame].mean(axis=0)
 
-        # Fixed charges E-field
         charges_fixed = get_charges_fixed(atoms)
         r, efield_fixed = compute_efield_radial(atoms, charges_fixed, com_frame, bin_edges)
         all_efield_fixed.append(efield_fixed)
 
-        # PolarMACE charges E-field
-        if polar_calc is not None:
-            charges_polar = get_charges_polarmace(atoms, polar_calc)
-            _, efield_polar = compute_efield_radial(atoms, charges_polar, com_frame, bin_edges)
-            all_efield_polar.append(efield_polar)
-
-            o_charges = charges_polar[[j for j, s in enumerate(symbols) if s == 'O']]
-            h_charges = charges_polar[[j for j, s in enumerate(symbols) if s == 'H']]
-            all_polar_charges_o.extend(o_charges)
-            all_polar_charges_h.extend(h_charges)
-
-        # Density profile
         _, density = compute_density_profile(atoms, com_frame, bin_edges)
         all_density.append(density)
 
-        # Orientational order
         _, orient = compute_orientational_order_profile(atoms, com_frame, bin_edges)
         all_orient.append(orient)
 
-        elapsed = time.time() - t0
-        rate = (idx + 1) / elapsed
-        eta = (len(frame_indices) - idx - 1) / rate
-        if (idx + 1) % 10 == 0 or idx == 0:
-            print(f"    [{idx+1}/{len(frame_indices)}] {rate:.1f} frames/min, ETA {eta/60:.1f} min")
+        if (idx + 1) % 20 == 0 or idx == 0:
+            elapsed = time.time() - t0
+            print(f"    Fixed charges: [{idx+1}/{len(frame_indices)}] {(idx+1)/elapsed:.1f} frames/s")
 
     traj.close()
+    print(f"  Fixed charges + structure done in {time.time()-t0:.0f}s")
+
+    # --- PolarMACE charges (GPU, multi-GPU if available) ---
+    if not skip_polar and n_gpus > 0:
+        from concurrent.futures import ProcessPoolExecutor
+        import torch.multiprocessing as mp
+        mp.set_start_method('spawn', force=True)
+
+        use_gpus = min(n_gpus, len(frame_indices))
+        print(f"  Running PolarMACE on {use_gpus} GPU(s)...")
+
+        # Split frames across GPUs
+        chunks = [[] for _ in range(use_gpus)]
+        for i, fi in enumerate(frame_indices):
+            chunks[i % use_gpus].append(fi)
+
+        worker_args = [(gpu_id, chunk, traj_path, bin_edges)
+                       for gpu_id, chunk in enumerate(chunks) if chunk]
+
+        t1 = time.time()
+        if use_gpus == 1:
+            # Single GPU — run in-process to avoid spawn overhead
+            all_results = [_polar_worker(worker_args[0])]
+        else:
+            with ProcessPoolExecutor(max_workers=use_gpus) as pool:
+                all_results = list(pool.map(_polar_worker, worker_args))
+
+        # Collect results in frame order
+        flat_results = []
+        for gpu_results in all_results:
+            flat_results.extend(gpu_results)
+
+        for efield, o_ch, h_ch in flat_results:
+            all_efield_polar.append(efield)
+            all_polar_charges_o.extend(o_ch)
+            all_polar_charges_h.extend(h_ch)
+
+        print(f"  PolarMACE done in {time.time()-t1:.0f}s ({use_gpus} GPUs)")
+    elif not skip_polar:
+        print(f"  No GPU available, skipping PolarMACE")
 
     # Aggregate
     r = 0.5 * (bin_edges[:-1] + bin_edges[1:])

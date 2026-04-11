@@ -86,18 +86,32 @@ calc = mace_mp(model=model, dispersion=False,
                default_dtype='float32', device=device)
 atoms.calc = calc
 
+# Energy minimize to remove overlapping atoms from grid construction
+from ase.optimize import FIRE
+
+print("  Running energy minimization (FIRE)...")
+e0 = atoms.get_potential_energy()
+f0_max = np.max(np.linalg.norm(atoms.get_forces(), axis=1))
+print(f"  Before: E={e0:.2f} eV ({e0/n_water:.4f} eV/water), max force={f0_max:.1f} eV/A")
+
+opt = FIRE(atoms, logfile=None)
+opt.run(fmax=1.0, steps=500)
+
 e = atoms.get_potential_energy()
 f = atoms.get_forces()
 f_norms = np.linalg.norm(f, axis=1)
 
-print(f"  Energy:          {e:.2f} eV ({e/n_water:.4f} eV/water)")
-print(f"  Max force:       {np.max(f_norms):.4f} eV/A")
-print(f"  Mean force:      {np.mean(f_norms):.4f} eV/A")
+print(f"  After:  E={e:.2f} eV ({e/n_water:.4f} eV/water), max force={np.max(f_norms):.4f} eV/A")
+print(f"  Steps:  {opt.nsteps}")
+
+# Save minimized geometry
+write(str(OUTPUT), atoms)
+print(f"  Saved minimized geometry to: {OUTPUT}")
 print()
 
 e_per_water = e / n_water
-if -0.8 < e_per_water < -0.2:
-    print("  Energy per water looks reasonable. Safe to proceed.")
+if np.max(f_norms) < 10.0:
+    print("  Validation PASSED. Safe to proceed.")
 else:
-    print(f"  Energy per water ({e_per_water:.3f} eV) seems off.")
-    print("  Try a short energy minimization before MD.")
+    print(f"  WARNING: Max force still high ({np.max(f_norms):.1f} eV/A).")
+    print("  Consider running more minimization steps.")

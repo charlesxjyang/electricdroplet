@@ -4,7 +4,7 @@ Phase 1: 20ns NVT MD with MACE-MP-0 large on g5.2xlarge.
 Run:    python run_phase1.py
 Resume: python run_phase1.py --resume
 """
-import argparse, time
+import argparse, os, time
 import numpy as np
 import torch
 from pathlib import Path
@@ -14,10 +14,10 @@ from ase.md.langevin import Langevin
 from ase import units
 from mace.calculators import mace_mp
 
-# === CONFIGURATION ===
+# === CONFIGURATION (matching Hao et al. 2022 protocol) ===
 TIMESTEP_FS    = 0.5
-TOTAL_STEPS    = 40_000_000   # 20 ns
-EQUIL_STEPS    = 2_000_000    # 1 ns equilibration
+TOTAL_STEPS    = 5_000_000    # 2.5 ns (0.5 ns equil + 2 ns production)
+EQUIL_STEPS    = 1_000_000    # 0.5 ns equilibration
 CHECKPOINT_INT = 2000         # Save restart every 1 ps
 TRAJ_INT       = 200          # Save frame every 0.1 ps
 LOG_INT        = 2000         # Print status every 1 ps
@@ -35,8 +35,11 @@ VALIDATION_FILE = WORK / "go_nogo_report.txt"
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
+MACE_MODEL = os.environ.get("MACE_MODEL", "medium")
+
+
 def get_calc():
-    return mace_mp(model='large', dispersion=False,
+    return mace_mp(model=MACE_MODEL, dispersion=False,
                    default_dtype='float32', device=DEVICE)
 
 

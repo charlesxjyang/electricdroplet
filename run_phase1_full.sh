@@ -1,18 +1,18 @@
 #!/bin/bash
-# Phase 1 orchestrator for g5.2xlarge GPU instance.
-# Runs the full pipeline end-to-end. Never stops on go/no-go — just logs.
+# Phase 1 orchestrator — runs full pipeline end-to-end.
 # Check progress anytime: cat phase1_status.txt
 #
 # Usage:
 #   bash run_phase1_full.sh          # full run from scratch
 #   bash run_phase1_full.sh --resume # resume interrupted MD
 #
-# Phases:
-#   1a: Build droplet + MACE validation        (~5 min)
-#   1b: 1 ns equilibration (go/no-go logged)   (~2-3 days)
-#   1c: Remaining 19 ns MD                     (~5-8 days)
-#   1d: PolarMACE E-field analysis             (~2-4 hours)
+# Configure via env vars (defaults shown):
+#   DROPLET_DIAMETER_NM=5.0  MACE_MODEL=medium  bash run_phase1_full.sh
 set -eo pipefail
+
+export DROPLET_DIAMETER_NM="${DROPLET_DIAMETER_NM:-5.0}"
+export MACE_MODEL="${MACE_MODEL:-medium}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 RESUME="${1:-}"
 STATUS_FILE="phase1_status.txt"

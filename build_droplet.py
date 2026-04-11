@@ -1,10 +1,11 @@
-"""Build 8nm water droplet and run initial validation with MACE-MP-0 large."""
+"""Build water droplet and run initial validation with MACE-MP-0."""
+import os
 import numpy as np
 from pathlib import Path
 from ase import Atoms
 from ase.io import write
 
-DIAMETER_NM = 8.0
+DIAMETER_NM = float(os.environ.get("DROPLET_DIAMETER_NM", "5.0"))
 OUTPUT = Path("droplet_initial.xyz")
 
 def build_water_droplet(diameter_nm):
@@ -79,7 +80,9 @@ print(f"  Device: {device}")
 if device == 'cuda':
     print(f"  GPU: {torch.cuda.get_device_name(0)}")
 
-calc = mace_mp(model='large', dispersion=False,
+model = os.environ.get("MACE_MODEL", "medium")
+print(f"  Model: {model}")
+calc = mace_mp(model=model, dispersion=False,
                default_dtype='float32', device=device)
 atoms.calc = calc
 

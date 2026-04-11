@@ -17,7 +17,7 @@ from ase import units
 from mace.calculators import MACECalculator
 
 TIMESTEP_FS    = 0.5
-TOTAL_STEPS    = 100_000_000  # 50 ns
+TOTAL_STEPS    = 5_000_000    # 2.5 ns (0.5 ns equil + 2 ns production)
 CHECKPOINT_INT = 2000
 TRAJ_INT       = 200          # 0.1 ps
 LOG_INT        = 2000

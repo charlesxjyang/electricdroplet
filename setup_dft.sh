@@ -20,10 +20,10 @@ fi
 conda create -n dft python=3.11 -y
 conda activate dft
 
-pip install pyscf numpy scipy h5py ase mace-torch torch
+pip install pyscf numpy scipy h5py ase torch
 
-# PySCF with libxc for DFT functionals
-pip install pyscf[all]
+# PySCF extras: libxc for functionals, dftd3 for dispersion
+pip install pyscf[all] pyscf-dftd3
 
 python -c "
 import pyscf

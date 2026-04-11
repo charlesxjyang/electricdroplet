@@ -141,6 +141,32 @@ def run(resume=False):
     print(f"Next: python extract_clusters.py")
 
 
+def compute_surface_potential_sign(atoms, com, r90):
+    """
+    Estimate surface electrostatic potential sign from fixed SPC/E charges.
+    Computes potential at a probe point just outside the droplet surface.
+    """
+    Q_O, Q_H = -0.8476, +0.4238
+    symbols = atoms.get_chemical_symbols()
+    positions = atoms.positions
+
+    charges = np.array([Q_O if s == 'O' else Q_H for s in symbols])
+
+    # Probe point at r90 + 2 A along +z
+    probe = com + np.array([0.0, 0.0, r90 + 2.0])
+    dr = probe - positions
+    dists = np.linalg.norm(dr, axis=1)
+    dists = np.maximum(dists, 0.1)  # avoid singularity
+
+    # Potential in arbitrary units (sign is what matters)
+    potential = np.sum(charges / dists)
+
+    if potential > 0:
+        return f"POSITIVE ({potential:.4f} arb. units)"
+    else:
+        return f"NEGATIVE ({potential:.4f} arb. units)"
+
+
 def compute_orientational_order(atoms, com, r90):
     """
     Compute <cos theta> for OH bonds, where theta is the angle between
@@ -264,6 +290,12 @@ def run_go_nogo_check(atoms, ns_per_day):
         report.append(f"  [FAIL] Orientational order:")
     report.append(f"           Surface <cos theta>: {surface_cos:+.3f} (positive = OH outward = correct)")
     report.append(f"           Bulk <cos theta>:    {bulk_cos:+.3f} (near zero = isotropic = correct)")
+
+    # Surface potential sign from fixed charges (quick diagnostic)
+    # C-GeM gives POSITIVE surface potential; classical fixed-charge models give NEGATIVE
+    surface_pot_sign = compute_surface_potential_sign(atoms, com, r90)
+    report.append(f"  [INFO] Fixed-charge surface potential: {surface_pot_sign}")
+    report.append(f"           (C-GeM ref: positive; classical models: negative)")
 
     report.append("")
     report.append(f"         Performance: {ns_per_day:.2f} ns/day")

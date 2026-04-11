@@ -16,9 +16,10 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from ase.io import read, write
 
-# DFT settings
-FUNCTIONAL = "pbe"       # PySCF functional name
-BASIS = "def2-svp"       # def2-SVP for speed; upgrade to def2-TZVP if budget allows
+# DFT settings — must match Hao et al. validation level
+FUNCTIONAL = "revpbe"    # revPBE functional (PySCF name)
+BASIS = "def2-tzvp"      # TZV2P-quality basis
+USE_D3 = True            # DFT-D3(BJ) dispersion correction
 MAX_WORKERS = 8           # parallel DFT jobs per instance (each uses ~4 cores)
 
 
@@ -47,8 +48,14 @@ def run_single_dft(cluster_path, output_dir):
         mol = gto.M(atom=atom_str, basis=BASIS, unit="Angstrom", verbose=0)
         mf = dft.RKS(mol)
         mf.xc = FUNCTIONAL
+        mf.grids.level = 4  # fine integration grid
         mf.max_cycle = 200
         mf.conv_tol = 1e-7
+
+        # D3(BJ) dispersion correction
+        if USE_D3:
+            from pyscf import dftd3
+            mf = dftd3.dftd3(mf)
 
         t0 = time.time()
         energy = mf.kernel()

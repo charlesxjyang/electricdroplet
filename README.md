@@ -12,9 +12,8 @@ Ab initio-quality MD simulation of an 8nm water microdroplet using MACE-MP-0, st
 
 ## Prerequisites
 
-- An S3 bucket for data transfer between instances
 - AWS CLI configured (`aws configure`) on all instances
-- Edit `s3_config.py` to set your bucket name
+- S3 bucket is preconfigured in `s3_config.py`
 
 ## Quick Start
 
@@ -24,9 +23,6 @@ Ab initio-quality MD simulation of an 8nm water microdroplet using MACE-MP-0, st
 git clone <this-repo> && cd electricdroplet
 bash setup_gpu.sh
 conda activate mace
-
-# Edit S3 bucket name
-vi s3_config.py   # set BUCKET = "s3://your-bucket/electricdroplet"
 
 # Build droplet + run 20ns MD
 python build_droplet.py
@@ -43,7 +39,6 @@ python extract_clusters.py --n-clusters 300
 git clone <this-repo> && cd electricdroplet
 bash setup_dft.sh
 conda activate dft
-vi s3_config.py   # same bucket name
 
 # Each instance runs a shard (auto-downloads clusters from S3)
 python run_dft.py --start 0 --end 75      # instance 1
@@ -63,8 +58,11 @@ python finetune_mace.py --dft-dir dft_results/
 python run_phase3.py --model mace_droplet.model
 python run_phase3.py --model mace_droplet.model --resume
 
-# Analysis
+# Analysis (PolarMACE + fixed charges, density, orientational order)
 python analyze_efield.py --trajectory phase3/trajectory.traj
+
+# Publication comparison figure vs C-GeM
+python compare_to_cgem.py
 ```
 
 ## Data Flow
@@ -89,10 +87,11 @@ analyze_efield.py
 1. **build_droplet.py** — Generates 8nm spherical water droplet (~9000 waters, ~27K atoms) and validates with MACE
 2. **run_phase1.py** — 20ns NVT Langevin MD at 300K with MACE-MP-0 large. Includes automatic go/no-go checkpoint after 1ns equilibration
 3. **extract_clusters.py** — Samples frames from production trajectory, extracts local water clusters for DFT
-4. **run_dft.py** — PySCF DFT single-points (PBE/def2-SVP) on clusters. Parallelized across cores, shardable across instances
+4. **run_dft.py** — PySCF DFT single-points (revPBE-D3/def2-TZVP) on clusters. Parallelized across cores, shardable across instances
 5. **finetune_mace.py** — Fine-tunes MACE-MP-0 large on DFT data for improved accuracy on the droplet system
 6. **run_phase3.py** — 50ns production MD with the fine-tuned model
-7. **analyze_efield.py** — Computes radial electric field profiles using point-charge model, generates plots
+7. **analyze_efield.py** — Dual E-field analysis: PolarMACE environment-dependent charges + fixed SPC/E charges for comparison. Also computes radial density and orientational order profiles
+8. **compare_to_cgem.py** — Publication-quality comparison figures against Hao et al. 2022 C-GeM reference
 
 ## Go/No-Go Checkpoint
 
@@ -101,9 +100,15 @@ Phase 1 automatically runs a diagnostic after 1ns equilibration, checking:
 - Temperature stability
 - Energy per water molecule
 - Density vs bulk water
+- Orientational order: surface `<cos theta>` > 0 means OH points outward (correct)
+- Fixed-charge surface potential sign (C-GeM: positive; classical: negative)
 - Performance (ns/day) and ETA
 
 Results are printed and saved to `phase1/go_nogo_report.txt`.
+
+## Reference Data
+
+`reference_data/hao2022_digitized.py` contains benchmark values from Hao, Leven & Head-Gordon, Nat. Commun. 13, 280 (2022). Hard numbers from the paper text are exact; digitized figure values are approximate and should be refined with [WebPlotDigitizer](https://automeris.io/WebPlotDigitizer/) before paper submission.
 
 ## Checkpointing
 

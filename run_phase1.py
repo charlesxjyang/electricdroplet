@@ -323,6 +323,8 @@ def run_go_nogo_check(atoms, ns_per_day):
     print(f"\nReport saved to: {VALIDATION_FILE}")
     print(f"{'='*60}\n")
 
+    return not fatal
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

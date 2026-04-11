@@ -94,12 +94,14 @@ def main(n_clusters=300, cutoff=6.0):
     print(f"  Waters per cluster: {np.min(sizes)}-{np.max(sizes)} (mean {np.mean(sizes):.0f})")
     print(f"  Manifest: {OUTPUT_DIR}/manifest.csv")
 
-    # Upload to S3
-    from s3_config import CLUSTERS_S3, sync_up
-    print(f"\nUploading clusters to S3...")
-    sync_up(OUTPUT_DIR, CLUSTERS_S3)
-    print(f"\nNext: on each DFT instance, run:")
-    print(f"  python run_dft.py --start 0 --end 75     # shard 1/4")
+    # Upload to S3 if available
+    try:
+        from s3_config import CLUSTERS_S3, sync_up
+        print(f"\nUploading clusters to S3...")
+        sync_up(OUTPUT_DIR, CLUSTERS_S3)
+    except Exception:
+        print(f"\nS3 upload skipped (running locally)")
+    print(f"\nNext: python run_dft.py --clusters-dir {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

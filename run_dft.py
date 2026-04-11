@@ -148,11 +148,14 @@ def main(clusters_dir, output_dir, start=None, end=None):
     print(f"\nDone: {ok}/{len(cluster_files)} converged")
     print(f"Total time: {(time.time()-t0)/3600:.1f} hours")
 
-    # Upload results to S3
-    from s3_config import DFT_RESULTS_S3, sync_up
-    print(f"\nUploading DFT results to S3...")
-    sync_up(output_dir, DFT_RESULTS_S3)
-    print(f"\nNext (on GPU instance): python finetune_mace.py")
+    # Upload results to S3 if available
+    try:
+        from s3_config import DFT_RESULTS_S3, sync_up
+        print(f"\nUploading DFT results to S3...")
+        sync_up(output_dir, DFT_RESULTS_S3)
+    except Exception:
+        print(f"\nS3 upload skipped (running locally)")
+    print(f"\nNext: python finetune_mace.py --dft-dir {output_dir}")
 
 
 if __name__ == "__main__":

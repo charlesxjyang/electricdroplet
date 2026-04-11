@@ -1,0 +1,29 @@
+# Trajectories and checkpoints (large files)
+phase1/
+phase3/
+*.traj
+restart.xyz
+
+# DFT and training data
+clusters/
+dft_results/
+finetune_output/
+training_data*.xyz
+
+# Model files
+*.model
+
+# Initial geometry (regenerate with build_droplet.py)
+droplet_initial.xyz
+
+# Analysis outputs
+analysis/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Environment
+.env
+*.log

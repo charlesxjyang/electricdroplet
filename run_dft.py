@@ -94,6 +94,14 @@ def main(clusters_dir, output_dir, start=None, end=None):
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
 
+    # Pull clusters from S3 if local dir is empty
+    if not any(clusters_dir.glob("cluster_*.xyz")):
+        clusters_dir.mkdir(exist_ok=True)
+        from s3_config import CLUSTERS_S3, sync_down
+        print("No local clusters found, downloading from S3...")
+        sync_down(CLUSTERS_S3, clusters_dir)
+        print()
+
     cluster_files = sorted(clusters_dir.glob("cluster_*.xyz"))
     if start is not None or end is not None:
         s = start or 0
@@ -132,7 +140,12 @@ def main(clusters_dir, output_dir, start=None, end=None):
     ok = sum(1 for r in results if r["status"] == "ok")
     print(f"\nDone: {ok}/{len(cluster_files)} converged")
     print(f"Total time: {(time.time()-t0)/3600:.1f} hours")
-    print(f"\nNext: python finetune_mace.py --dft-dir {output_dir}")
+
+    # Upload results to S3
+    from s3_config import DFT_RESULTS_S3, sync_up
+    print(f"\nUploading DFT results to S3...")
+    sync_up(output_dir, DFT_RESULTS_S3)
+    print(f"\nNext (on GPU instance): python finetune_mace.py")
 
 
 if __name__ == "__main__":

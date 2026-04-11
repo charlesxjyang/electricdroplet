@@ -110,10 +110,25 @@ def finetune(train_file, test_file, output_model="mace_droplet.model"):
 
 
 def main(dft_dir, output_model="mace_droplet.model"):
+    dft_path = Path(dft_dir)
+
+    # Pull DFT results from S3 if local dir is empty
+    if not any(dft_path.glob("cluster_*.json")):
+        dft_path.mkdir(exist_ok=True)
+        from s3_config import DFT_RESULTS_S3, sync_down
+        print("No local DFT results found, downloading from S3...")
+        sync_down(DFT_RESULTS_S3, dft_path)
+        print()
+
     train_file, test_file = collect_training_data(
         dft_dir, "training_data.xyz"
     )
     finetune(train_file, test_file, output_model)
+
+    # Upload fine-tuned model to S3
+    from s3_config import MODELS_S3, upload_file
+    print(f"\nUploading model to S3...")
+    upload_file(output_model, f"{MODELS_S3}/{output_model}")
 
 
 if __name__ == "__main__":

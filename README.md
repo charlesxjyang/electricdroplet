@@ -10,39 +10,78 @@ Ab initio-quality MD simulation of an 8nm water microdroplet using MACE-MP-0, st
 | 2 (DFT) | 4x c6i.8xlarge | 32 vCPU, 64GB RAM each | DFT single-points on clusters |
 | 3 (MD) | g5.2xlarge | A10G 24GB VRAM, 32GB RAM | Fine-tune + 50ns production MD |
 
+## Prerequisites
+
+- An S3 bucket for data transfer between instances
+- AWS CLI configured (`aws configure`) on all instances
+- Edit `s3_config.py` to set your bucket name
+
 ## Quick Start
 
+### Phase 1 — GPU instance (g5.2xlarge)
+
 ```bash
-# On g5.2xlarge
 git clone <this-repo> && cd electricdroplet
 bash setup_gpu.sh
 conda activate mace
 
-# Phase 1: Build droplet + run 20ns MD
+# Edit S3 bucket name
+vi s3_config.py   # set BUCKET = "s3://your-bucket/electricdroplet"
+
+# Build droplet + run 20ns MD
 python build_droplet.py
 python run_phase1.py              # ~1-2 weeks on A10G
 python run_phase1.py --resume     # if interrupted
 
-# Extract clusters for DFT
+# Extract clusters -> auto-uploads to S3
 python extract_clusters.py --n-clusters 300
+```
 
-# Copy clusters to DFT instances, then on each c6i.8xlarge:
+### Phase 2 — DFT instances (4x c6i.8xlarge)
+
+```bash
+git clone <this-repo> && cd electricdroplet
 bash setup_dft.sh
 conda activate dft
-python run_dft.py --clusters-dir clusters/ --start 0 --end 75    # shard 1/4
-python run_dft.py --clusters-dir clusters/ --start 75 --end 150  # shard 2/4
-python run_dft.py --clusters-dir clusters/ --start 150 --end 225 # shard 3/4
-python run_dft.py --clusters-dir clusters/ --start 225 --end 300 # shard 4/4
+vi s3_config.py   # same bucket name
 
-# Collect DFT results back to GPU instance, then:
+# Each instance runs a shard (auto-downloads clusters from S3)
+python run_dft.py --start 0 --end 75      # instance 1
+python run_dft.py --start 75 --end 150    # instance 2
+python run_dft.py --start 150 --end 225   # instance 3
+python run_dft.py --start 225 --end 300   # instance 4
+# Results auto-upload to S3 when done
+```
+
+### Phase 3 — Back on GPU instance
+
+```bash
+# Fine-tune (auto-downloads DFT results from S3)
 python finetune_mace.py --dft-dir dft_results/
 
-# Phase 3: 50ns production with fine-tuned model
+# 50ns production MD with fine-tuned model
 python run_phase3.py --model mace_droplet.model
 python run_phase3.py --model mace_droplet.model --resume
 
 # Analysis
 python analyze_efield.py --trajectory phase3/trajectory.traj
+```
+
+## Data Flow
+
+```
+GPU (g5.2xlarge)                S3 Bucket                   CPU (4x c6i.8xlarge)
+────────────────                ─────────                   ────────────────────
+build_droplet.py
+run_phase1.py
+extract_clusters.py
+  clusters/ ──────────────>  /clusters/  ──────────────>  clusters/
+                                                          run_dft.py
+                             /dft_results/ <────────────  dft_results/
+finetune_mace.py <────────
+  mace_droplet.model ────>  /models/
+run_phase3.py
+analyze_efield.py
 ```
 
 ## Pipeline Overview

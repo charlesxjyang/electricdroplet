@@ -1,13 +1,8 @@
-"""
-S3 bucket configuration for data transfer between GPU and CPU instances.
-Edit BUCKET before first use.
-"""
+"""S3 bucket configuration for data transfer between GPU and CPU instances."""
 import subprocess
 import sys
 
-# ──── EDIT THIS ────
-BUCKET = "s3://your-bucket-name/electricdroplet"
-# ───────────────────
+BUCKET = "s3://electricdroplet/electricdroplet"
 
 # S3 paths
 CLUSTERS_S3 = f"{BUCKET}/clusters"
@@ -47,9 +42,6 @@ def download_file(s3_path, local_path):
 
 
 if __name__ == "__main__":
-    if BUCKET == "s3://your-bucket-name/electricdroplet":
-        print("ERROR: Edit BUCKET in s3_config.py before running.")
-        sys.exit(1)
     print(f"Bucket: {BUCKET}")
     subprocess.run(["aws", "s3", "ls", BUCKET + "/"], check=True)
     print("S3 access OK.")

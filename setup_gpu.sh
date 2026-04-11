@@ -24,16 +24,27 @@ conda activate mace
 # PyTorch with CUDA 12.1
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# MACE and dependencies
-pip install mace-torch ase numpy scipy matplotlib h5py
+# MACE (develop branch for PolarMACE support) + dependencies
+pip install git+https://github.com/ACEsuit/mace.git@develop
+pip install ase numpy scipy matplotlib h5py
 
-# Verify
+# PolarMACE long-range electrostatics dependency
+pip install git+https://github.com/WillBaldwin0/graph_electrostatics.git
+
+# Verify CUDA
 python -c "
 import torch
 assert torch.cuda.is_available(), 'CUDA not available!'
 print(f'PyTorch {torch.__version__}')
 print(f'CUDA device: {torch.cuda.get_device_name(0)}')
 print(f'VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
+"
+
+# Verify MACE + PolarMACE
+python -c "
+from mace.calculators import mace_mp, mace_polar
+print('MACE-MP-0 large: OK')
+print('PolarMACE: OK')
 "
 
 echo ""

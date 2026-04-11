@@ -141,6 +141,50 @@ def run(resume=False):
     print(f"Next: python extract_clusters.py")
 
 
+def compute_orientational_order(atoms, com, r90):
+    """
+    Compute <cos theta> for OH bonds, where theta is the angle between
+    the OH vector and the radial outward direction from the droplet COM.
+
+    Returns (surface_cos, bulk_cos).
+    Surface = oxygen within 5 A of r90. Bulk = oxygen more than 10 A inside.
+    """
+    symbols = atoms.get_chemical_symbols()
+    positions = atoms.positions
+
+    surface_cosines = []
+    bulk_cosines = []
+
+    for i, s in enumerate(symbols):
+        if s != 'O':
+            continue
+        o_pos = positions[i]
+        r_vec = o_pos - com
+        r_dist = np.linalg.norm(r_vec)
+        if r_dist < 1e-6:
+            continue
+        r_hat = r_vec / r_dist
+
+        # H atoms follow each O in build order: O, H, H
+        for h_idx in [i + 1, i + 2]:
+            if h_idx >= len(symbols) or symbols[h_idx] != 'H':
+                continue
+            oh_vec = positions[h_idx] - o_pos
+            oh_len = np.linalg.norm(oh_vec)
+            if oh_len < 1e-6:
+                continue
+            cos_theta = np.dot(oh_vec / oh_len, r_hat)
+
+            if r_dist > r90 - 5.0:
+                surface_cosines.append(cos_theta)
+            elif r_dist < r90 - 10.0:
+                bulk_cosines.append(cos_theta)
+
+    surface_cos = np.mean(surface_cosines) if surface_cosines else 0.0
+    bulk_cos = np.mean(bulk_cosines) if bulk_cosines else 0.0
+    return float(surface_cos), float(bulk_cos)
+
+
 def run_go_nogo_check(atoms, ns_per_day):
     print(f"\n{'='*60}")
     print("GO / NO-GO CHECKPOINT (after 1 ns equilibration)")
@@ -208,6 +252,19 @@ def run_go_nogo_check(atoms, ns_per_day):
     expected_r = DIAMETER_NM * 10 / 2
     r_deviation = abs(r90 - expected_r) / expected_r * 100
     report.append(f"         Effective radius: {r90:.1f} A (expected ~{expected_r:.0f} A, {r_deviation:.0f}% off)")
+
+    # Orientational order parameter: <cos theta> for OH bonds vs radial direction
+    # theta = angle between OH bond vector and radial outward direction from COM
+    # Positive <cos theta> at surface = OH points outward (correct physics)
+    surface_cos, bulk_cos = compute_orientational_order(atoms, com, r90)
+    if surface_cos > 0.0:
+        report.append(f"  [OK]   Orientational order:")
+    else:
+        issues.append("SURFACE OH ORIENTATION WRONG")
+        report.append(f"  [FAIL] Orientational order:")
+    report.append(f"           Surface <cos theta>: {surface_cos:+.3f} (positive = OH outward = correct)")
+    report.append(f"           Bulk <cos theta>:    {bulk_cos:+.3f} (near zero = isotropic = correct)")
+
     report.append("")
     report.append(f"         Performance: {ns_per_day:.2f} ns/day")
     report.append(f"         ETA remaining: {eta_days:.1f} days")

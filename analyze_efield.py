@@ -1,104 +1,173 @@
 """
-Analyze electric field profiles from Phase 3 production trajectory.
+Analyze electric field profiles from MD trajectory.
 
-Computes:
-  - Radial electric field profile E(r) from oxygen-hydrogen charge distribution
-  - Time-averaged and instantaneous field maps
-  - Surface vs bulk field comparison
+Two charge models computed on each frame:
+  1. PolarMACE — ML-predicted environment-dependent per-atom charges
+  2. Fixed SPC/E charges (O: -0.8476e, H: +0.4238e) — for comparison
 
-Usage: python analyze_efield.py [--trajectory phase3/trajectory.traj]
+Also computes:
+  - Radial density profile rho(r)
+  - Orientational order parameter <cos theta>(r)
+
+Usage:
+  python analyze_efield.py --trajectory phase3/trajectory.traj
+  python analyze_efield.py --trajectory phase1/trajectory.traj --n-frames 50
+  python analyze_efield.py --trajectory phase1/trajectory.traj --skip-polar  # fixed charges only
 """
 import argparse
 import numpy as np
+import time
+import torch
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 from ase.io.trajectory import Trajectory
 
-# Partial charges (SPC/E-like, reasonable for field estimation)
-Q_O = -0.8476  # e
-Q_H = +0.4238  # e
-E_CHARGE = 1.602176634e-19       # C
-BOHR_TO_M = 5.29177210903e-11
+# Physical constants
+E_CHARGE_C = 1.602176634e-19
 ANGSTROM_TO_M = 1e-10
 K_COULOMB = 8.9875517873681764e9  # N m^2 / C^2
-V_PER_M_TO_V_PER_NM = 1e-9
+
+# Fixed SPC/E charges
+Q_O_FIXED = -0.8476  # e
+Q_H_FIXED = +0.4238  # e
 
 OUTPUT_DIR = Path("analysis")
+NBINS = 50
 
 
-def compute_efield_at_points(atoms, probe_points):
+def get_polar_calc(device='cuda'):
+    """Load PolarMACE calculator."""
+    from mace.calculators import mace_polar
+    return mace_polar(model='polar-1-s', device=device, default_dtype='float32')
+
+
+def get_charges_polarmace(atoms, calc):
+    """Run PolarMACE on a frame and return per-atom charges in units of e."""
+    atoms_copy = atoms.copy()
+    atoms_copy.info['charge'] = 0
+    atoms_copy.info['spin'] = 1
+    atoms_copy.info['external_field'] = [0.0, 0.0, 0.0]
+    atoms_copy.calc = calc
+    atoms_copy.get_potential_energy()
+    return calc.results['charges'].copy()
+
+
+def get_charges_fixed(atoms):
+    """Return fixed SPC/E charges for each atom."""
+    return np.array([Q_O_FIXED if s == 'O' else Q_H_FIXED
+                     for s in atoms.get_chemical_symbols()])
+
+
+def compute_efield_radial(atoms, charges_e, com, bin_edges, n_probes=50):
     """
-    Compute electric field at probe points from point-charge model.
-    Returns field vectors in V/nm at each probe point.
+    Compute radially-averaged E-field magnitude from point charges.
+
+    For each radial shell, place probe points on a sphere and compute
+    the Coulomb E-field from all atomic charges. Returns field in V/m.
     """
-    symbols = atoms.get_chemical_symbols()
-    positions = atoms.positions * ANGSTROM_TO_M  # to meters
-    probe_m = probe_points * ANGSTROM_TO_M
+    positions_m = atoms.positions * ANGSTROM_TO_M
+    com_m = com * ANGSTROM_TO_M
+    charges_C = charges_e * E_CHARGE_C
 
-    charges = np.array([Q_O if s == 'O' else Q_H for s in symbols])
-    charges_C = charges * E_CHARGE
-
-    fields = np.zeros((len(probe_m), 3))
-    for i, p in enumerate(probe_m):
-        dr = p - positions  # (N, 3)
-        r = np.linalg.norm(dr, axis=1)
-        r = np.maximum(r, 1e-12)  # avoid division by zero
-        # E = k * q * r_hat / r^2
-        e_contrib = K_COULOMB * charges_C[:, None] * dr / (r[:, None] ** 3)
-        fields[i] = e_contrib.sum(axis=0)
-
-    # Convert V/m to V/nm
-    return fields * V_PER_M_TO_V_PER_NM
-
-
-def radial_field_profile(atoms, n_bins=50, r_max=None):
-    """Compute radially-averaged electric field magnitude as function of distance from COM."""
-    symbols = atoms.get_chemical_symbols()
-    o_indices = [i for i, s in enumerate(symbols) if s == 'O']
-    o_pos = atoms.positions[o_indices]
-    com = o_pos.mean(axis=0)
-
-    if r_max is None:
-        r_max = np.max(np.linalg.norm(o_pos - com, axis=1)) + 2.0
-
-    # Probe points along radial shells
-    bin_edges = np.linspace(0, r_max, n_bins + 1)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    field_magnitudes = np.zeros(n_bins)
-    counts = np.zeros(n_bins)
+    field_mag = np.zeros(len(bin_centers))
 
-    # Sample probe points on each shell
-    n_probes_per_shell = 50
     rng = np.random.default_rng(0)
 
-    for bi in range(n_bins):
-        r = bin_centers[bi]
-        if r < 0.5:
+    for bi, r_A in enumerate(bin_centers):
+        if r_A < 0.5:
             continue
+        r_m = r_A * ANGSTROM_TO_M
 
         # Random points on sphere of radius r
-        phi = rng.uniform(0, 2 * np.pi, n_probes_per_shell)
-        cos_theta = rng.uniform(-1, 1, n_probes_per_shell)
+        phi = rng.uniform(0, 2 * np.pi, n_probes)
+        cos_theta = rng.uniform(-1, 1, n_probes)
         sin_theta = np.sqrt(1 - cos_theta**2)
 
-        probes = np.column_stack([
-            r * sin_theta * np.cos(phi),
-            r * sin_theta * np.sin(phi),
-            r * cos_theta,
-        ]) + com
+        probes_m = np.column_stack([
+            r_m * sin_theta * np.cos(phi),
+            r_m * sin_theta * np.sin(phi),
+            r_m * cos_theta,
+        ]) + com_m
 
-        fields = compute_efield_at_points(atoms, probes)
-        field_mags = np.linalg.norm(fields, axis=1)
+        shell_fields = np.zeros(n_probes)
+        for pi, p in enumerate(probes_m):
+            dr = p - positions_m
+            r = np.linalg.norm(dr, axis=1)
+            r = np.maximum(r, 1e-12)
+            e_vec = K_COULOMB * charges_C[:, None] * dr / (r[:, None] ** 3)
+            shell_fields[pi] = np.linalg.norm(e_vec.sum(axis=0))
 
-        field_magnitudes[bi] = field_mags.mean()
-        counts[bi] = n_probes_per_shell
+        field_mag[bi] = shell_fields.mean()
 
-    return bin_centers, field_magnitudes
+    return bin_centers, field_mag
 
 
-def main(traj_path, n_frames=100):
+def compute_density_profile(atoms, com, bin_edges):
+    """Compute radial number density of oxygen atoms (molecules/nm^3)."""
+    symbols = atoms.get_chemical_symbols()
+    o_pos = atoms.positions[[i for i, s in enumerate(symbols) if s == 'O']]
+    radii = np.linalg.norm(o_pos - com, axis=1)
+
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    counts, _ = np.histogram(radii, bins=bin_edges)
+
+    # Shell volumes in nm^3
+    r_lo = bin_edges[:-1] * 0.1  # A -> nm
+    r_hi = bin_edges[1:] * 0.1
+    shell_vol = 4/3 * np.pi * (r_hi**3 - r_lo**3)
+    shell_vol = np.maximum(shell_vol, 1e-30)
+
+    density = counts / shell_vol  # molecules/nm^3
+    return bin_centers, density
+
+
+def compute_orientational_order_profile(atoms, com, bin_edges):
+    """
+    Compute <cos theta>(r) where theta is the angle between OH bond vector
+    and the radial outward direction from COM.
+    """
+    symbols = atoms.get_chemical_symbols()
+    positions = atoms.positions
+
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    cos_sums = np.zeros(len(bin_centers))
+    cos_counts = np.zeros(len(bin_centers))
+
+    for i, s in enumerate(symbols):
+        if s != 'O':
+            continue
+        o_pos = positions[i]
+        r_vec = o_pos - com
+        r_dist = np.linalg.norm(r_vec)
+        if r_dist < 1e-6:
+            continue
+        r_hat = r_vec / r_dist
+
+        bi = np.searchsorted(bin_edges, r_dist) - 1
+        if bi < 0 or bi >= len(bin_centers):
+            continue
+
+        for h_idx in [i + 1, i + 2]:
+            if h_idx >= len(symbols) or symbols[h_idx] != 'H':
+                continue
+            oh_vec = positions[h_idx] - o_pos
+            oh_len = np.linalg.norm(oh_vec)
+            if oh_len < 1e-6:
+                continue
+            cos_theta = np.dot(oh_vec / oh_len, r_hat)
+            cos_sums[bi] += cos_theta
+            cos_counts[bi] += 1
+
+    mask = cos_counts > 0
+    cos_avg = np.zeros(len(bin_centers))
+    cos_avg[mask] = cos_sums[mask] / cos_counts[mask]
+    return bin_centers, cos_avg
+
+
+def main(traj_path, n_frames=100, skip_polar=False):
     OUTPUT_DIR.mkdir(exist_ok=True)
     traj_path = Path(traj_path)
 
@@ -107,76 +176,219 @@ def main(traj_path, n_frames=100):
     n_total = len(traj)
     print(f"  Total frames: {n_total}")
 
-    # Sample evenly across trajectory
     frame_indices = np.linspace(0, n_total - 1, min(n_frames, n_total), dtype=int)
-    print(f"  Analyzing {len(frame_indices)} frames...")
+    print(f"  Analyzing {len(frame_indices)} frames")
 
-    all_profiles = []
-    for i, fi in enumerate(frame_indices):
+    # Determine droplet geometry from last frame
+    atoms_last = traj[-1]
+    symbols = atoms_last.get_chemical_symbols()
+    o_idx = [j for j, s in enumerate(symbols) if s == 'O']
+    o_pos = atoms_last.positions[o_idx]
+    com = o_pos.mean(axis=0)
+    r90 = np.percentile(np.linalg.norm(o_pos - com, axis=1), 90)
+    r_max = r90 + 10.0
+
+    bin_edges = np.linspace(0, r_max, NBINS + 1)
+
+    # Load PolarMACE if needed
+    polar_calc = None
+    if not skip_polar:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"  Loading PolarMACE (device={device})...")
+        polar_calc = get_polar_calc(device=device)
+
+    # Accumulate results
+    all_efield_polar = []
+    all_efield_fixed = []
+    all_density = []
+    all_orient = []
+    all_polar_charges_o = []
+    all_polar_charges_h = []
+
+    t0 = time.time()
+    for idx, fi in enumerate(frame_indices):
         atoms = traj[fi]
-        r, E_r = radial_field_profile(atoms)
-        all_profiles.append(E_r)
-        if (i + 1) % 20 == 0:
-            print(f"    {i+1}/{len(frame_indices)}")
+        symbols = atoms.get_chemical_symbols()
+        o_idx_frame = [j for j, s in enumerate(symbols) if s == 'O']
+        com_frame = atoms.positions[o_idx_frame].mean(axis=0)
+
+        # Fixed charges E-field
+        charges_fixed = get_charges_fixed(atoms)
+        r, efield_fixed = compute_efield_radial(atoms, charges_fixed, com_frame, bin_edges)
+        all_efield_fixed.append(efield_fixed)
+
+        # PolarMACE charges E-field
+        if polar_calc is not None:
+            charges_polar = get_charges_polarmace(atoms, polar_calc)
+            _, efield_polar = compute_efield_radial(atoms, charges_polar, com_frame, bin_edges)
+            all_efield_polar.append(efield_polar)
+
+            o_charges = charges_polar[[j for j, s in enumerate(symbols) if s == 'O']]
+            h_charges = charges_polar[[j for j, s in enumerate(symbols) if s == 'H']]
+            all_polar_charges_o.extend(o_charges)
+            all_polar_charges_h.extend(h_charges)
+
+        # Density profile
+        _, density = compute_density_profile(atoms, com_frame, bin_edges)
+        all_density.append(density)
+
+        # Orientational order
+        _, orient = compute_orientational_order_profile(atoms, com_frame, bin_edges)
+        all_orient.append(orient)
+
+        elapsed = time.time() - t0
+        rate = (idx + 1) / elapsed
+        eta = (len(frame_indices) - idx - 1) / rate
+        if (idx + 1) % 10 == 0 or idx == 0:
+            print(f"    [{idx+1}/{len(frame_indices)}] {rate:.1f} frames/min, ETA {eta/60:.1f} min")
 
     traj.close()
 
-    profiles = np.array(all_profiles)
-    mean_profile = profiles.mean(axis=0)
-    std_profile = profiles.std(axis=0)
+    # Aggregate
+    r = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    efield_fixed_mean = np.mean(all_efield_fixed, axis=0)
+    efield_fixed_std = np.std(all_efield_fixed, axis=0)
+    density_mean = np.mean(all_density, axis=0)
+    orient_mean = np.mean(all_orient, axis=0)
 
-    # Save data
-    np.savez(
-        OUTPUT_DIR / "efield_radial.npz",
-        r_angstrom=r,
-        mean_field_v_per_nm=mean_profile,
-        std_field_v_per_nm=std_profile,
-        all_profiles=profiles,
-    )
+    # Convert E-field from V/m to MV/cm (1 MV/cm = 1e8 V/m)
+    VM_TO_MVCM = 1e-8
+    efield_fixed_mean_mvcm = efield_fixed_mean * VM_TO_MVCM
+    efield_fixed_std_mvcm = efield_fixed_std * VM_TO_MVCM
 
-    # Get droplet radius for annotation
-    atoms_last = traj[-1] if hasattr(traj, '__getitem__') else atoms
-    symbols = atoms.get_chemical_symbols()
-    o_idx = [j for j, s in enumerate(symbols) if s == 'O']
-    o_pos = atoms.positions[o_idx]
-    com = o_pos.mean(axis=0)
-    r90 = np.percentile(np.linalg.norm(o_pos - com, axis=1), 90)
+    results = {
+        'r_angstrom': r,
+        'r90_angstrom': r90,
+        'efield_fixed_mean_mvcm': efield_fixed_mean_mvcm,
+        'efield_fixed_std_mvcm': efield_fixed_std_mvcm,
+        'density_mean_per_nm3': density_mean,
+        'orient_cos_mean': orient_mean,
+    }
 
-    # Plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(r, mean_profile, 'b-', linewidth=2, label='Mean E-field')
-    ax.fill_between(r, mean_profile - std_profile, mean_profile + std_profile,
-                    alpha=0.3, color='blue', label='1 std')
-    ax.axvline(r90, color='red', linestyle='--', alpha=0.7, label=f'Droplet surface (~{r90:.0f} A)')
-    ax.set_xlabel('Distance from center (A)', fontsize=14)
-    ax.set_ylabel('Electric field magnitude (V/nm)', fontsize=14)
-    ax.set_title('Radial Electric Field Profile — 8nm Water Microdroplet', fontsize=14)
-    ax.legend(fontsize=12)
-    ax.set_xlim(0, r.max())
+    if all_efield_polar:
+        efield_polar_mean = np.mean(all_efield_polar, axis=0)
+        efield_polar_std = np.std(all_efield_polar, axis=0)
+        efield_polar_mean_mvcm = efield_polar_mean * VM_TO_MVCM
+        efield_polar_std_mvcm = efield_polar_std * VM_TO_MVCM
+        results['efield_polar_mean_mvcm'] = efield_polar_mean_mvcm
+        results['efield_polar_std_mvcm'] = efield_polar_std_mvcm
+        results['polar_charges_o_mean'] = np.mean(all_polar_charges_o)
+        results['polar_charges_o_std'] = np.std(all_polar_charges_o)
+        results['polar_charges_h_mean'] = np.mean(all_polar_charges_h)
+        results['polar_charges_h_std'] = np.std(all_polar_charges_h)
+
+    np.savez(OUTPUT_DIR / "efield_analysis.npz", **results)
+
+    # --- Plots ---
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Plot 1: E-field profiles
+    ax = axes[0, 0]
+    ax.plot(r, efield_fixed_mean_mvcm, 'b-', linewidth=2, label='Fixed SPC/E charges')
+    ax.fill_between(r, efield_fixed_mean_mvcm - efield_fixed_std_mvcm,
+                    efield_fixed_mean_mvcm + efield_fixed_std_mvcm, alpha=0.2, color='blue')
+    if all_efield_polar:
+        ax.plot(r, efield_polar_mean_mvcm, 'r-', linewidth=2, label='PolarMACE charges')
+        ax.fill_between(r, efield_polar_mean_mvcm - efield_polar_std_mvcm,
+                        efield_polar_mean_mvcm + efield_polar_std_mvcm, alpha=0.2, color='red')
+    ax.axvline(r90, color='gray', linestyle='--', alpha=0.5, label=f'Surface (~{r90:.0f} A)')
+    ax.axhline(16.0, color='green', linestyle=':', alpha=0.7, label='C-GeM ref: 16 MV/cm')
+    ax.set_xlabel('Distance from center (A)')
+    ax.set_ylabel('E-field magnitude (MV/cm)')
+    ax.set_title('Radial Electric Field Profile')
+    ax.legend(fontsize=9)
+    ax.set_xlim(0, r_max)
     ax.grid(True, alpha=0.3)
+
+    # Plot 2: Density profile
+    ax = axes[0, 1]
+    ax.plot(r, density_mean, 'k-', linewidth=2)
+    ax.axhline(33.4, color='blue', linestyle=':', alpha=0.5, label='Bulk water (33.4/nm3)')
+    ax.axvline(r90, color='gray', linestyle='--', alpha=0.5, label=f'Surface')
+    ax.set_xlabel('Distance from center (A)')
+    ax.set_ylabel('Density (molecules/nm3)')
+    ax.set_title('Radial Density Profile')
+    ax.legend(fontsize=9)
+    ax.set_xlim(0, r_max)
+    ax.grid(True, alpha=0.3)
+
+    # Plot 3: Orientational order parameter
+    ax = axes[1, 0]
+    ax.plot(r, orient_mean, 'k-', linewidth=2)
+    ax.axhline(0.0, color='gray', linestyle='-', alpha=0.3)
+    ax.axvline(r90, color='gray', linestyle='--', alpha=0.5, label=f'Surface')
+    ax.set_xlabel('Distance from center (A)')
+    ax.set_ylabel('<cos theta>')
+    ax.set_title('Orientational Order Parameter')
+    ax.legend(fontsize=9)
+    ax.set_xlim(0, r_max)
+    ax.grid(True, alpha=0.3)
+
+    # Plot 4: Charge distribution (PolarMACE) or summary stats
+    ax = axes[1, 1]
+    if all_polar_charges_o:
+        ax.hist(all_polar_charges_o, bins=50, alpha=0.7, color='red', label='O charges', density=True)
+        ax.hist(all_polar_charges_h, bins=50, alpha=0.7, color='blue', label='H charges', density=True)
+        ax.axvline(Q_O_FIXED, color='red', linestyle=':', label=f'SPC/E O ({Q_O_FIXED})')
+        ax.axvline(Q_H_FIXED, color='blue', linestyle=':', label=f'SPC/E H ({Q_H_FIXED})')
+        ax.set_xlabel('Charge (e)')
+        ax.set_ylabel('Probability density')
+        ax.set_title('PolarMACE Charge Distribution')
+        ax.legend(fontsize=8)
+    else:
+        ax.text(0.5, 0.5, 'PolarMACE disabled\n(--skip-polar)',
+                transform=ax.transAxes, ha='center', va='center', fontsize=14)
+        ax.set_title('PolarMACE Charges')
+    ax.grid(True, alpha=0.3)
+
+    fig.suptitle('8nm Water Microdroplet — Electric Field Analysis', fontsize=14, y=1.02)
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "efield_radial.png", dpi=150)
+    fig.savefig(OUTPUT_DIR / "efield_analysis.png", dpi=150, bbox_inches='tight')
+    fig.savefig(OUTPUT_DIR / "efield_analysis.pdf", bbox_inches='tight')
     plt.close()
 
-    # Surface field stats
+    # --- Print summary ---
+    print(f"\nResults saved to {OUTPUT_DIR}/")
+    print(f"  efield_analysis.npz")
+    print(f"  efield_analysis.png")
+    print(f"  efield_analysis.pdf")
+
     surface_mask = (r > r90 - 5) & (r < r90 + 5)
     bulk_mask = r < r90 - 10
-    surface_field = mean_profile[surface_mask].mean() if surface_mask.any() else 0
-    bulk_field = mean_profile[bulk_mask].mean() if bulk_mask.any() else 0
 
-    print(f"\nResults saved to {OUTPUT_DIR}/")
-    print(f"  efield_radial.npz  — raw data")
-    print(f"  efield_radial.png  — plot")
     print(f"\nSummary:")
     print(f"  Droplet radius (90th pct): {r90:.1f} A")
-    print(f"  Bulk field (<{r90-10:.0f} A):       {bulk_field:.2f} V/nm")
-    print(f"  Surface field (~{r90:.0f} A):     {surface_field:.2f} V/nm")
-    print(f"  Surface/Bulk ratio:         {surface_field/bulk_field:.1f}x" if bulk_field > 0 else "")
+
+    sf = efield_fixed_mean_mvcm[surface_mask].mean() if surface_mask.any() else 0
+    bf = efield_fixed_mean_mvcm[bulk_mask].mean() if bulk_mask.any() else 0
+    print(f"  Fixed-charge E-field:")
+    print(f"    Bulk:    {bf:.2f} MV/cm")
+    print(f"    Surface: {sf:.2f} MV/cm")
+    print(f"    Enhancement: {sf - bf:.2f} MV/cm (ref: 16 MV/cm)")
+
+    if all_efield_polar:
+        sp = efield_polar_mean_mvcm[surface_mask].mean() if surface_mask.any() else 0
+        bp = efield_polar_mean_mvcm[bulk_mask].mean() if bulk_mask.any() else 0
+        print(f"  PolarMACE E-field:")
+        print(f"    Bulk:    {bp:.2f} MV/cm")
+        print(f"    Surface: {sp:.2f} MV/cm")
+        print(f"    Enhancement: {sp - bp:.2f} MV/cm (ref: 16 MV/cm)")
+        print(f"  PolarMACE charges:")
+        print(f"    O: {results['polar_charges_o_mean']:.4f} +/- {results['polar_charges_o_std']:.4f} e")
+        print(f"    H: {results['polar_charges_h_mean']:.4f} +/- {results['polar_charges_h_std']:.4f} e")
+
+    so = orient_mean[surface_mask].mean() if surface_mask.any() else 0
+    bo = orient_mean[bulk_mask].mean() if bulk_mask.any() else 0
+    print(f"  Orientational order:")
+    print(f"    Bulk <cos theta>:    {bo:+.3f}")
+    print(f"    Surface <cos theta>: {so:+.3f}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--trajectory", default="phase3/trajectory.traj")
     parser.add_argument("--n-frames", type=int, default=100)
+    parser.add_argument("--skip-polar", action="store_true",
+                        help="Skip PolarMACE, use fixed charges only")
     args = parser.parse_args()
-    main(args.trajectory, args.n_frames)
+    main(args.trajectory, args.n_frames, args.skip_polar)

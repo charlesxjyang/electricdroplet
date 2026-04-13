@@ -1,5 +1,11 @@
 """
-Phase 1: 20ns NVT MD with MACE-MP-0 large on g5.2xlarge.
+Phase 1: NVT MD with MACE-MP-0 on g6e.2xlarge (L40S).
+
+Protocol: up to 0.5 ns equilibration + 2 ns production (Hao et al. 2022).
+Early convergence: if the surface orientational order, density, and spread
+ratio are all stable across two consecutive 50-ps windows (starting at
+0.2 ns), equilibration is declared done early and production begins
+immediately — shortening walltime.
 
 Run:    python run_phase1.py
 Resume: python run_phase1.py --resume
@@ -16,13 +22,32 @@ from mace.calculators import mace_mp
 
 # === CONFIGURATION (matching Hao et al. 2022 protocol) ===
 TIMESTEP_FS    = 0.5
-TOTAL_STEPS    = 5_000_000    # 2.5 ns (0.5 ns equil + 2 ns production)
-EQUIL_STEPS    = 1_000_000    # 0.5 ns equilibration
+TOTAL_STEPS    = 5_000_000    # 2.5 ns (0.5 ns equil + 2 ns production) upper bound
+EQUIL_STEPS    = 1_000_000    # 0.5 ns equilibration cap (early convergence may cut this)
+PRODUCTION_STEPS = TOTAL_STEPS - EQUIL_STEPS  # 4,000,000 = 2 ns production
 CHECKPOINT_INT = 2000         # Save restart every 1 ps
 TRAJ_INT       = 200          # Save frame every 0.1 ps
 LOG_INT        = 2000         # Print status every 1 ps
 TEMPERATURE    = 300.0        # K
 DIAMETER_NM    = 8.0
+
+# === EARLY CONVERGENCE DETECTION ===
+# Start checking after 0.2 ns; compare last 50 ps vs previous 50 ps; require 2
+# consecutive passes. If all three observables are stable within tolerance,
+# equilibration is declared done and production begins immediately — saving
+# walltime vs running the full 0.5 ns cap.
+CONV_CHECK_START   = 400_000  # 0.2 ns: earliest convergence check
+CONV_CHECK_STRIDE  = 100_000  # 50 ps between checks
+CONV_WINDOW        = 50       # number of 1-ps samples per window
+CONV_PASSES_REQ    = 2        # consecutive passes required
+CONV_TOL_COS_THETA = 0.02     # |Δ<cos θ>_surface| between windows
+CONV_TOL_DENSITY   = 0.01     # |Δρ|/ρ (relative)
+CONV_TOL_SPREAD    = 0.01     # |Δ spread ratio|
+
+
+class StopEarly(Exception):
+    """Raised from a callback to terminate the MD loop cleanly."""
+    pass
 
 WORK = Path("phase1")
 WORK.mkdir(exist_ok=True)
@@ -70,6 +95,15 @@ def run(resume=False):
     t0 = time.time()
     step_offset = start_step
 
+    # Convergence / early-termination state
+    conv = {
+        'samples': [],          # list of {step, surf_cos, density, spread, T}
+        'passes': 0,            # consecutive passing convergence checks
+        'converged_step': None, # step at which equilibration was declared done
+        'target_end': TOTAL_STEPS,  # last step to run (may shrink on early conv)
+        'gng_fired': False,     # whether go/no-go has been written
+    }
+
     def save_traj():
         traj.write(atoms)
 
@@ -78,15 +112,38 @@ def run(resume=False):
         write(str(RESTART), atoms)
         np.savez(str(CKPT_META), step=step)
 
+    def _measure():
+        """Cheap per-step metrics for convergence tracking."""
+        symbols = atoms.get_chemical_symbols()
+        positions = atoms.positions
+        o_idx = [i for i, s in enumerate(symbols) if s == 'O']
+        o_pos = positions[o_idx]
+        com = o_pos.mean(axis=0)
+        radii = np.linalg.norm(o_pos - com, axis=1)
+        r90 = float(np.percentile(radii, 90))
+        spread = float(np.max(radii) / r90)
+        density = len(o_idx) / (4/3 * np.pi * r90**3 * 1e-3)
+        surf_cos, _ = compute_orientational_order(atoms, com, r90)
+        return {
+            'com': com, 'r90': r90, 'spread': spread,
+            'density': density, 'surf_cos': surf_cos,
+            'T': atoms.get_temperature(),
+        }
+
+    def _current_ns_per_day():
+        if dyn.nsteps <= 0:
+            return 0.0
+        elapsed = time.time() - t0
+        return (dyn.nsteps * TIMESTEP_FS * 1e-6) / (elapsed / 86400)
+
     def status():
         step = step_offset + dyn.nsteps
-        elapsed = time.time() - t0
-        if dyn.nsteps > 0:
-            ns_per_day = (dyn.nsteps * TIMESTEP_FS * 1e-6) / (elapsed / 86400)
-            remaining_ns = (TOTAL_STEPS - step) * TIMESTEP_FS * 1e-6
-            eta_days = remaining_ns / ns_per_day if ns_per_day > 0 else 999
+        ns_per_day = _current_ns_per_day()
+        if ns_per_day > 0:
+            remaining_ns = (conv['target_end'] - step) * TIMESTEP_FS * 1e-6
+            eta_days = remaining_ns / ns_per_day
         else:
-            ns_per_day, eta_days = 0, 999
+            eta_days = 999
 
         sim_time_ns = step * TIMESTEP_FS * 1e-6
         T = atoms.get_temperature()
@@ -98,23 +155,93 @@ def run(resume=False):
                f"{ns_per_day:>5.2f} ns/day | ETA {eta_days:>5.1f} d")
         print(msg, flush=True)
 
-        if step == EQUIL_STEPS and step_offset < EQUIL_STEPS:
-            run_go_nogo_check(atoms, ns_per_day)
+        # Sample observables while still in equilibration
+        if conv['converged_step'] is None and step < EQUIL_STEPS:
+            m = _measure()
+            conv['samples'].append({
+                'step': step, 'surf_cos': m['surf_cos'],
+                'density': m['density'], 'spread': m['spread'], 'T': m['T'],
+            })
+
+        # Fallback: if we reach the 0.5 ns cap without early convergence,
+        # fire go/no-go there (original behavior).
+        if (not conv['gng_fired']) and step >= EQUIL_STEPS:
+            conv['gng_fired'] = True
+            conv['converged_step'] = step
+            # target_end already TOTAL_STEPS; keep production = 2 ns from here
+            run_go_nogo_check(atoms, ns_per_day, equil_step=step)
+
+        # Early termination when we've reached the (possibly shrunken) target
+        if step >= conv['target_end']:
+            raise StopEarly()
+
+    def check_convergence():
+        """Fires every CONV_CHECK_STRIDE. Declares early equilibration done
+        when all observables are stable across two consecutive 50-ps windows."""
+        step = step_offset + dyn.nsteps
+        if conv['gng_fired'] or conv['converged_step'] is not None:
+            return
+        if step < CONV_CHECK_START:
+            return
+        samples = conv['samples']
+        if len(samples) < 2 * CONV_WINDOW:
+            return
+
+        recent = samples[-CONV_WINDOW:]
+        prev = samples[-2 * CONV_WINDOW:-CONV_WINDOW]
+
+        def m(key, subset):
+            return float(np.mean([s[key] for s in subset]))
+
+        d_cos = abs(m('surf_cos', recent) - m('surf_cos', prev))
+        rho_prev = m('density', prev)
+        d_rho_rel = abs(m('density', recent) - rho_prev) / rho_prev
+        d_spr = abs(m('spread', recent) - m('spread', prev))
+
+        passed = (d_cos < CONV_TOL_COS_THETA and
+                  d_rho_rel < CONV_TOL_DENSITY and
+                  d_spr < CONV_TOL_SPREAD)
+
+        tag = f"[conv {conv['passes']+1 if passed else 0}/{CONV_PASSES_REQ}]"
+        print(f"{tag} step={step:,} Δ<cosθ>={d_cos:.4f} "
+              f"Δρ={d_rho_rel*100:.2f}% Δspread={d_spr:.4f}", flush=True)
+
+        if passed:
+            conv['passes'] += 1
+            if conv['passes'] >= CONV_PASSES_REQ:
+                conv['converged_step'] = step
+                conv['gng_fired'] = True
+                new_end = min(step + PRODUCTION_STEPS, TOTAL_STEPS)
+                conv['target_end'] = new_end
+                saved_steps = EQUIL_STEPS - step
+                saved_ns = saved_steps * TIMESTEP_FS * 1e-6
+                print(f"\n*** EARLY CONVERGENCE at step {step:,} "
+                      f"({step * TIMESTEP_FS * 1e-6:.3f} ns). "
+                      f"Saved {saved_ns:.3f} ns ({saved_steps:,} steps) of equilibration. "
+                      f"Production ends at step {new_end:,} "
+                      f"({new_end * TIMESTEP_FS * 1e-6:.3f} ns) ***\n",
+                      flush=True)
+                run_go_nogo_check(atoms, _current_ns_per_day(), equil_step=step)
+        else:
+            conv['passes'] = 0
 
     dyn.attach(save_traj, interval=TRAJ_INT)
     dyn.attach(checkpoint, interval=CHECKPOINT_INT)
     dyn.attach(status, interval=LOG_INT)
+    dyn.attach(check_convergence, interval=CONV_CHECK_STRIDE)
 
     remaining = TOTAL_STEPS - start_step
     total_ns = TOTAL_STEPS * TIMESTEP_FS * 1e-6
     remaining_ns = remaining * TIMESTEP_FS * 1e-6
 
     print(f"\n{'='*60}")
-    print(f"Phase 1: 8nm Water Droplet — MACE-MP-0 Large NVT MD")
+    print(f"Phase 1: Water Droplet — MACE-MP-0 {MACE_MODEL} NVT MD")
     print(f"{'='*60}")
-    print(f"Total target:  {total_ns:.1f} ns ({TOTAL_STEPS:,} steps)")
+    print(f"Max target:    {total_ns:.1f} ns ({TOTAL_STEPS:,} steps)")
     print(f"Remaining:     {remaining_ns:.1f} ns ({remaining:,} steps)")
-    print(f"Equilibration: {EQUIL_STEPS * TIMESTEP_FS * 1e-6:.1f} ns")
+    print(f"Equil cap:     {EQUIL_STEPS * TIMESTEP_FS * 1e-6:.1f} ns "
+          f"(early convergence may cut short after "
+          f"{CONV_CHECK_START * TIMESTEP_FS * 1e-6:.1f} ns)")
     print(f"Checkpoint:    every {CHECKPOINT_INT * TIMESTEP_FS * 1e-3:.1f} ps")
     print(f"Trajectory:    every {TRAJ_INT * TIMESTEP_FS * 1e-3:.2f} ps")
     print(f"Device:        {DEVICE}", end="")
@@ -126,6 +253,12 @@ def run(resume=False):
 
     try:
         dyn.run(remaining)
+    except StopEarly:
+        checkpoint()
+        final_step = step_offset + dyn.nsteps
+        print(f"\nReached target end step {final_step:,} "
+              f"({final_step * TIMESTEP_FS * 1e-6:.3f} ns). Phase 1 complete.",
+              flush=True)
     except KeyboardInterrupt:
         print("\nInterrupted — saving checkpoint...")
         checkpoint()
@@ -214,9 +347,10 @@ def compute_orientational_order(atoms, com, r90):
     return float(surface_cos), float(bulk_cos)
 
 
-def run_go_nogo_check(atoms, ns_per_day):
+def run_go_nogo_check(atoms, ns_per_day, equil_step=None):
+    equil_ns = (equil_step * TIMESTEP_FS * 1e-6) if equil_step is not None else EQUIL_STEPS * TIMESTEP_FS * 1e-6
     print(f"\n{'='*60}")
-    print("GO / NO-GO CHECKPOINT (after 1 ns equilibration)")
+    print(f"GO / NO-GO CHECKPOINT (after {equil_ns:.3f} ns equilibration)")
     print(f"{'='*60}")
 
     symbols = atoms.get_chemical_symbols()
@@ -245,6 +379,8 @@ def run_go_nogo_check(atoms, ns_per_day):
     report = []
     report.append(f"Go/No-Go Report — {time.strftime('%Y-%m-%d %H:%M')}")
     report.append(f"{'='*50}")
+    report.append(f"Equilibration time: {equil_ns:.3f} ns "
+                  f"(cap = {EQUIL_STEPS * TIMESTEP_FS * 1e-6:.3f} ns)")
     report.append("")
 
     if spread > 1.5:

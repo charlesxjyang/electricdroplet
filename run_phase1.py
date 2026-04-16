@@ -39,7 +39,9 @@ DIAMETER_NM    = 8.0
 CONV_CHECK_START   = 400_000  # 0.2 ns: earliest convergence check
 CONV_CHECK_STRIDE  = 100_000  # 50 ps between checks
 CONV_WINDOW        = 50       # number of 1-ps samples per window
-CONV_PASSES_REQ    = 2        # consecutive passes required
+CONV_PASSES_REQ    = 1        # passes required before declaring equilibrated
+                              # (lowered from 2 after 160-ps probe showed signals
+                              # deep inside tolerance with monotonic tightening)
 CONV_TOL_COS_THETA = 0.02     # |Δ<cos θ>_surface| between windows
 CONV_TOL_DENSITY   = 0.01     # |Δρ|/ρ (relative)
 CONV_TOL_SPREAD    = 0.01     # |Δ spread ratio|

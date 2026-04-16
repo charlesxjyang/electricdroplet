@@ -15,8 +15,12 @@ TRAJ_FILE="phase1/trajectory.traj"
 GO_NOGO_FILE="phase1/go_nogo_report.txt"
 CLUSTERS_DIR="clusters"
 DFT_DIR="dft_results"
-N_CLUSTERS=300
-EXTRACT_INTERVAL=600  # check for new frames every 10 min
+DFT_HYBRID_DIR="dft_hybrid"     # supplementary revPBE0-D3 spot-check outputs
+N_SURFACE=120
+N_INTERFACE=90
+N_BULK=90
+N_HYBRID_SPOTCHECK=30           # surface clusters re-run at hybrid level
+EXTRACT_INTERVAL=600            # check for new frames every 10 min
 CUTOFF=6.0
 
 log() {
@@ -47,9 +51,14 @@ python -c "import pyscf" 2>/dev/null || {
     log "PySCF installed"
 }
 
-# ── Extract clusters from trajectory ────────────────────────────
-log "Extracting $N_CLUSTERS clusters from production frames..."
-python extract_clusters.py --n-clusters "$N_CLUSTERS" --cutoff "$CUTOFF" 2>&1
+# ── Extract clusters from trajectory (stratified) ───────────────
+N_TOTAL=$((N_SURFACE + N_INTERFACE + N_BULK))
+log "Extracting $N_TOTAL clusters (stratified: $N_SURFACE surface / $N_INTERFACE interface / $N_BULK bulk)..."
+python extract_clusters.py \
+    --n-surface "$N_SURFACE" \
+    --n-interface "$N_INTERFACE" \
+    --n-bulk "$N_BULK" \
+    --cutoff "$CUTOFF" 2>&1
 
 if [ ! -d "$CLUSTERS_DIR" ] || [ -z "$(ls $CLUSTERS_DIR/cluster_*.xyz 2>/dev/null)" ]; then
     log "ERROR: No clusters extracted. Check trajectory."
@@ -59,13 +68,13 @@ fi
 N_EXTRACTED=$(ls "$CLUSTERS_DIR"/cluster_*.xyz 2>/dev/null | wc -l)
 log "Extracted $N_EXTRACTED clusters"
 
-# ── Run DFT on CPUs ─────────────────────────────────────────────
+# ── Run primary DFT pass on CPUs (revPBE-D3) ────────────────────
 # Use 2 parallel workers with 4 cores each (leaves 1 core free for MD)
 export OMP_NUM_THREADS=4
 N_WORKERS=2
 
-log "Starting DFT: $N_EXTRACTED clusters, $N_WORKERS parallel workers, $OMP_NUM_THREADS threads each"
-log "Functional: revPBE-D3 / def2-TZVP"
+log "Starting DFT primary pass: $N_EXTRACTED clusters, $N_WORKERS parallel workers, $OMP_NUM_THREADS threads each"
+log "Functional: revPBE-D3 / def2-TZVP (matches Hao et al.)"
 
 python run_dft.py \
     --clusters-dir "$CLUSTERS_DIR" \
@@ -74,8 +83,27 @@ python run_dft.py \
 
 N_DONE=$(ls "$DFT_DIR"/cluster_*.json 2>/dev/null | wc -l)
 N_OK=$(grep -l '"status": "ok"' "$DFT_DIR"/cluster_*.json 2>/dev/null | wc -l)
+log "Primary DFT complete: $N_OK/$N_DONE converged"
 
-log "DFT complete: $N_OK/$N_DONE converged"
+# ── Supplementary hybrid spot-check on surface clusters ─────────
+# revPBE0-D3 is ~5× slower than revPBE-D3. Limited to N_HYBRID_SPOTCHECK
+# surface clusters to bound cost while quantifying the functional error
+# on the physics that matters for the paper.
 log ""
-log "Results in $DFT_DIR/"
-log "Next: python finetune_mace.py --dft-dir $DFT_DIR"
+log "Starting hybrid spot-check: $N_HYBRID_SPOTCHECK surface clusters at revPBE0-D3"
+python run_dft.py \
+    --clusters-dir "$CLUSTERS_DIR" \
+    --output-dir "$DFT_HYBRID_DIR" \
+    --functional revpbe0 \
+    --filter '*_surface.xyz' \
+    --end "$N_HYBRID_SPOTCHECK" \
+    --workers "$N_WORKERS" 2>&1
+
+N_HYBRID_DONE=$(ls "$DFT_HYBRID_DIR"/cluster_*.json 2>/dev/null | wc -l)
+N_HYBRID_OK=$(grep -l '"status": "ok"' "$DFT_HYBRID_DIR"/cluster_*.json 2>/dev/null | wc -l)
+log "Hybrid spot-check complete: $N_HYBRID_OK/$N_HYBRID_DONE converged"
+
+log ""
+log "Results in $DFT_DIR/ (primary) and $DFT_HYBRID_DIR/ (hybrid spot-check)"
+log "Next: python validate_polarmace_vs_dft.py --dft-dir $DFT_DIR"
+log "      python finetune_mace.py --dft-dir $DFT_DIR"

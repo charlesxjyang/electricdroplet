@@ -1,12 +1,21 @@
 """
 Phase 2: DFT single-point calculations on extracted clusters using PySCF.
-Run on c6i.8xlarge instances (32 vCPU, 64GB RAM).
 
-Computes energy and forces at revPBE-D3 / def2-TZVP level for MACE fine-tuning.
+Computes energy, forces, dipole, and Mulliken charges at the requested level
+for MACE fine-tuning. The functional/basis are CLI-overridable so the same
+script runs the primary pass (revPBE-D3/def2-TZVP, matching Hao et al.) and
+the supplementary hybrid spot-check (revPBE0-D3, surface clusters only).
 
 Usage:
+  # Primary pass — all clusters at GGA
   python run_dft.py --clusters-dir clusters/
-  python run_dft.py --clusters-dir clusters/ --start 0 --end 75   # shard across instances
+
+  # Shard across instances
+  python run_dft.py --clusters-dir clusters/ --start 0 --end 75
+
+  # Supplementary hybrid spot-check on surface clusters only
+  python run_dft.py --clusters-dir clusters/ --functional revpbe0 \\
+      --output-dir dft_hybrid --filter '*_surface.xyz' --end 30
 """
 import argparse
 import numpy as np
@@ -16,17 +25,20 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from ase.io import read, write
 
-# DFT settings — must match Hao et al. validation level
+# Defaults — match Hao et al. validation level. Overridable via CLI.
 FUNCTIONAL = "revpbe"    # revPBE functional (PySCF name)
 BASIS = "def2-tzvp"      # TZV2P-quality basis
 USE_D3 = True            # DFT-D3(BJ) dispersion correction
-MAX_WORKERS = 8           # parallel DFT jobs per instance (each uses ~4 cores)
+MAX_WORKERS = 8          # parallel DFT jobs per instance (each uses ~4 cores)
 
 
-def run_single_dft(cluster_path, output_dir):
+def run_single_dft(cluster_path, output_dir, functional=None, basis=None):
     """Run DFT on one cluster, return results dict."""
     import pyscf
     from pyscf import gto, dft
+
+    xc = functional or FUNCTIONAL
+    bs = basis or BASIS
 
     fname = Path(cluster_path).name
     out_file = output_dir / fname.replace(".xyz", ".json")
@@ -45,9 +57,9 @@ def run_single_dft(cluster_path, output_dir):
     )
 
     try:
-        mol = gto.M(atom=atom_str, basis=BASIS, unit="Angstrom", verbose=0)
+        mol = gto.M(atom=atom_str, basis=bs, unit="Angstrom", verbose=0)
         mf = dft.RKS(mol)
-        mf.xc = FUNCTIONAL
+        mf.xc = xc
         mf.grids.level = 4  # fine integration grid
         mf.max_cycle = 200
         mf.conv_tol = 1e-7
@@ -100,8 +112,8 @@ def run_single_dft(cluster_path, output_dir):
             "symbols": symbols,
             "positions_ang": positions.tolist(),
             "n_atoms": len(atoms),
-            "functional": FUNCTIONAL,
-            "basis": BASIS,
+            "functional": xc,
+            "basis": bs,
             "time_s": elapsed,
         }
 
@@ -119,7 +131,8 @@ def run_single_dft(cluster_path, output_dir):
         return {"file": fname, "status": "error", "error": str(e)}
 
 
-def main(clusters_dir, output_dir, start=None, end=None):
+def main(clusters_dir, output_dir, start=None, end=None,
+         functional=None, basis=None, pattern="cluster_*.xyz"):
     clusters_dir = Path(clusters_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True)
@@ -132,14 +145,16 @@ def main(clusters_dir, output_dir, start=None, end=None):
         sync_down(CLUSTERS_S3, clusters_dir)
         print()
 
-    cluster_files = sorted(clusters_dir.glob("cluster_*.xyz"))
+    cluster_files = sorted(clusters_dir.glob(pattern))
     if start is not None or end is not None:
         s = start or 0
         e = end or len(cluster_files)
         cluster_files = cluster_files[s:e]
 
-    print(f"DFT single-points: {len(cluster_files)} clusters")
-    print(f"  Functional: {FUNCTIONAL} / {BASIS}")
+    xc = functional or FUNCTIONAL
+    bs = basis or BASIS
+    print(f"DFT single-points: {len(cluster_files)} clusters (pattern: {pattern})")
+    print(f"  Functional: {xc} / {bs}")
     print(f"  Workers: {MAX_WORKERS}")
     print(f"  Output: {output_dir}/")
     print()
@@ -150,7 +165,7 @@ def main(clusters_dir, output_dir, start=None, end=None):
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
-            pool.submit(run_single_dft, str(cf), output_dir): cf
+            pool.submit(run_single_dft, str(cf), output_dir, xc, bs): cf
             for cf in cluster_files
         }
         for future in futures:
@@ -188,6 +203,16 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=None)
     parser.add_argument("--end", type=int, default=None)
     parser.add_argument("--workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("--functional", default=None,
+                        help=f"DFT functional (default: {FUNCTIONAL}). "
+                             "For hybrid spot-check use 'revpbe0'.")
+    parser.add_argument("--basis", default=None,
+                        help=f"Basis set (default: {BASIS}).")
+    parser.add_argument("--filter", default="cluster_*.xyz", dest="pattern",
+                        help="Glob pattern for cluster filenames "
+                             "(default: all clusters). Use '*_surface.xyz' "
+                             "to restrict to the surface stratum.")
     args = parser.parse_args()
     MAX_WORKERS = args.workers
-    main(args.clusters_dir, Path(args.output_dir), args.start, args.end)
+    main(args.clusters_dir, Path(args.output_dir), args.start, args.end,
+         functional=args.functional, basis=args.basis, pattern=args.pattern)

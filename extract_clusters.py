@@ -1,10 +1,24 @@
 """
 Extract water clusters from Phase 1 trajectory for DFT single-point calculations.
 
-Samples frames across the production portion of the trajectory, then for each
-frame selects a random oxygen and extracts all waters within a cutoff radius.
+Uses STRATIFIED sampling by radial position: the center oxygen of each cluster
+is drawn from one of three concentric regions defined relative to the droplet's
+90th-percentile radius r90:
 
-Usage: python extract_clusters.py [--n-clusters 300] [--cutoff 6.0]
+  - surface:   r > r90 - 4 Å       (outermost ~4 Å shell)
+  - interface: r90 - 8 < r ≤ r90-4 (next 4 Å inward)
+  - bulk:      r ≤ r90 - 8         (deeper core)
+
+Uniform random O selection would give a Boltzmann-weighted sample — fine for
+homogeneous systems but under-represents surface environments in a finite
+droplet where the paper's physics claim lives. Stratifying to 40/30/30
+(surface/interface/bulk) ensures the MLIP fine-tuning set has the surface
+coverage needed to defend the surface E-field enhancement result.
+
+Usage:
+  python extract_clusters.py                                   # 120/90/90 default
+  python extract_clusters.py --n-surface 150 --n-interface 75 --n-bulk 75
+  python extract_clusters.py --cutoff 7.0                      # bigger clusters
 """
 import argparse
 import numpy as np
@@ -16,6 +30,10 @@ from ase import Atoms
 TRAJ_FILE = Path("phase1/trajectory.traj")
 EQUIL_FRAMES = 10_000  # first 10K frames = 1ns equilibration, skip these
 OUTPUT_DIR = Path("clusters")
+
+# Stratum boundaries in Å, as inward offsets from r90
+SURFACE_THICKNESS = 4.0    # surface: r > r90 - 4
+INTERFACE_THICKNESS = 8.0  # interface: r90 - 8 < r ≤ r90 - 4
 
 
 def extract_cluster(atoms, center_o_idx, cutoff_A):
@@ -45,7 +63,26 @@ def extract_cluster(atoms, center_o_idx, cutoff_A):
     return cluster
 
 
-def main(n_clusters=300, cutoff=6.0):
+def _classify_by_radius(radii, r90):
+    """Return label array ('surface' | 'interface' | 'bulk') for each radius."""
+    labels = np.full(len(radii), 'bulk', dtype=object)
+    labels[radii > r90 - INTERFACE_THICKNESS] = 'interface'
+    labels[radii > r90 - SURFACE_THICKNESS] = 'surface'
+    return labels
+
+
+def _droplet_geometry(atoms):
+    """Return (com, r90) for the current frame's oxygen positions."""
+    symbols = atoms.get_chemical_symbols()
+    positions = atoms.positions
+    o_positions = positions[[i for i, s in enumerate(symbols) if s == 'O']]
+    com = o_positions.mean(axis=0)
+    radii = np.linalg.norm(o_positions - com, axis=1)
+    r90 = float(np.percentile(radii, 90))
+    return com, r90
+
+
+def main(n_surface, n_interface, n_bulk, cutoff):
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     print(f"Loading trajectory from {TRAJ_FILE}...")
@@ -55,42 +92,92 @@ def main(n_clusters=300, cutoff=6.0):
     print(f"  Skipping first {EQUIL_FRAMES} (equilibration)")
 
     prod_frames = list(range(EQUIL_FRAMES, n_frames))
-    if len(prod_frames) < n_clusters:
-        print(f"  Warning: only {len(prod_frames)} production frames, reducing cluster count")
-        n_clusters = len(prod_frames)
+    if not prod_frames:
+        raise SystemExit("No production frames available after equilibration skip.")
+
+    # Reference r90 from a late-production frame (stable geometry)
+    ref_frame = prod_frames[len(prod_frames) // 2]
+    _, ref_r90 = _droplet_geometry(traj[ref_frame])
+    print(f"  Reference r90 (from frame {ref_frame}): {ref_r90:.2f} Å")
+    print(f"  Stratum boundaries:")
+    print(f"    surface:   r > {ref_r90 - SURFACE_THICKNESS:.2f} Å")
+    print(f"    interface: {ref_r90 - INTERFACE_THICKNESS:.2f} < r ≤ {ref_r90 - SURFACE_THICKNESS:.2f} Å")
+    print(f"    bulk:      r ≤ {ref_r90 - INTERFACE_THICKNESS:.2f} Å")
+
+    targets = {'surface': n_surface, 'interface': n_interface, 'bulk': n_bulk}
+    counts = {k: 0 for k in targets}
+    total_target = sum(targets.values())
+    print(f"  Target: {targets} (total {total_target})")
 
     rng = np.random.default_rng(123)
-    frame_indices = sorted(rng.choice(prod_frames, size=n_clusters, replace=False))
-
-    print(f"  Extracting {n_clusters} clusters (cutoff={cutoff} A)...")
-
     manifest = []
-    for i, fi in enumerate(frame_indices):
+    cluster_idx = 0
+
+    # Safety limit on attempts: if we can't fill a stratum in ~20× target
+    # attempts, something is wrong with geometry or equilibration.
+    max_attempts = 20 * total_target
+    attempts = 0
+
+    while sum(counts.values()) < total_target and attempts < max_attempts:
+        attempts += 1
+
+        # Which strata still need samples?
+        needed = [s for s, t in targets.items() if counts[s] < t]
+        if not needed:
+            break
+        # Prefer least-filled stratum to avoid early saturation of one bucket
+        stratum = min(needed, key=lambda s: counts[s])
+
+        # Try to find a frame with at least one eligible O in this stratum
+        fi = int(rng.choice(prod_frames))
         atoms = traj[fi]
         symbols = atoms.get_chemical_symbols()
-        o_indices = [j for j, s in enumerate(symbols) if s == 'O']
+        positions = atoms.positions
+        o_indices = np.array([i for i, s in enumerate(symbols) if s == 'O'])
+        o_pos = positions[o_indices]
+        com = o_pos.mean(axis=0)
+        radii = np.linalg.norm(o_pos - com, axis=1)
+        labels = _classify_by_radius(radii, ref_r90)
 
-        center_o = rng.choice(o_indices)
+        eligible = o_indices[labels == stratum]
+        if len(eligible) == 0:
+            continue  # this frame has no O in the target stratum — retry
+
+        center_o = int(rng.choice(eligible))
         cluster = extract_cluster(atoms, center_o, cutoff)
         n_waters = sum(1 for s in cluster.get_chemical_symbols() if s == 'O')
+        r_center = float(np.linalg.norm(positions[center_o] - com))
 
-        fname = f"cluster_{i:04d}.xyz"
+        fname = f"cluster_{cluster_idx:04d}_{stratum}.xyz"
         write(str(OUTPUT_DIR / fname), cluster)
-        manifest.append(f"{fname},{fi},{n_waters},{len(cluster)}")
+        manifest.append({
+            'filename': fname, 'frame': fi, 'stratum': stratum,
+            'r_center_A': r_center, 'n_waters': n_waters,
+            'n_atoms': len(cluster),
+        })
+        counts[stratum] += 1
+        cluster_idx += 1
 
-        if (i + 1) % 50 == 0:
-            print(f"    {i+1}/{n_clusters} done")
-
-    # Write manifest
-    with open(OUTPUT_DIR / "manifest.csv", 'w') as f:
-        f.write("filename,frame,n_waters,n_atoms\n")
-        for line in manifest:
-            f.write(line + "\n")
+        if cluster_idx % 25 == 0:
+            print(f"    {cluster_idx}/{total_target}  "
+                  f"(S={counts['surface']}, I={counts['interface']}, B={counts['bulk']})")
 
     traj.close()
 
-    sizes = [int(m.split(',')[2]) for m in manifest]
-    print(f"\nDone! {n_clusters} clusters saved to {OUTPUT_DIR}/")
+    if sum(counts.values()) < total_target:
+        print(f"\n  WARNING: filled only {sum(counts.values())}/{total_target} "
+              f"after {attempts} attempts. Counts: {counts}")
+
+    # Write manifest
+    with open(OUTPUT_DIR / "manifest.csv", 'w') as f:
+        f.write("filename,frame,stratum,r_center_A,n_waters,n_atoms\n")
+        for m in manifest:
+            f.write(f"{m['filename']},{m['frame']},{m['stratum']},"
+                    f"{m['r_center_A']:.3f},{m['n_waters']},{m['n_atoms']}\n")
+
+    sizes = [m['n_waters'] for m in manifest]
+    print(f"\nDone! {len(manifest)} clusters saved to {OUTPUT_DIR}/")
+    print(f"  Counts by stratum: {counts}")
     print(f"  Waters per cluster: {np.min(sizes)}-{np.max(sizes)} (mean {np.mean(sizes):.0f})")
     print(f"  Manifest: {OUTPUT_DIR}/manifest.csv")
 
@@ -106,8 +193,14 @@ def main(n_clusters=300, cutoff=6.0):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--n-clusters", type=int, default=300)
+    parser.add_argument("--n-surface", type=int, default=120,
+                        help="Clusters centered in the surface shell (r > r90-4 Å)")
+    parser.add_argument("--n-interface", type=int, default=90,
+                        help="Clusters centered in the interface shell (r90-8 < r ≤ r90-4 Å)")
+    parser.add_argument("--n-bulk", type=int, default=90,
+                        help="Clusters centered in the bulk core (r ≤ r90-8 Å)")
     parser.add_argument("--cutoff", type=float, default=6.0,
                         help="Cutoff radius in Angstrom for cluster extraction")
     args = parser.parse_args()
-    main(n_clusters=args.n_clusters, cutoff=args.cutoff)
+    main(n_surface=args.n_surface, n_interface=args.n_interface,
+         n_bulk=args.n_bulk, cutoff=args.cutoff)

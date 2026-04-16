@@ -64,9 +64,25 @@ def run_single_dft(cluster_path, output_dir):
         if not mf.converged:
             return {"file": fname, "status": "not_converged", "time": elapsed}
 
+        # Sanity check: HOMO-LUMO gap. Sub-2 eV on a closed-shell water cluster
+        # is diagnostic of pathological SCF (fractional occupations, near-
+        # metallic state) — flag so fine-tuning doesn't silently learn bad
+        # forces.
+        mo_energy = mf.mo_energy
+        mo_occ = mf.mo_occ
+        homo = float(mo_energy[mo_occ > 0].max())
+        lumo = float(mo_energy[mo_occ == 0].min())
+        gap_ev = (lumo - homo) * 27.211386245988
+
         # Analytical nuclear gradients -> forces
         g = mf.nuc_grad_method().kernel()
         forces = -g  # gradient -> force
+
+        # Post-SCF quantities for PolarMACE cross-validation (Phase 1d):
+        #   - Mulliken charges: per-atom, for direct comparison to PolarMACE
+        #   - Dipole moment: integrated test (PolarMACE was trained on dipoles)
+        mulliken_charges = mf.mulliken_pop(verbose=0)[1]  # returns (pop, chg)
+        dipole_debye = mf.dip_moment(unit='Debye', verbose=0)
 
         # Convert to eV and eV/A
         ha_to_ev = 27.211386245988
@@ -78,6 +94,9 @@ def run_single_dft(cluster_path, output_dir):
             "energy_ha": float(energy),
             "energy_ev": float(energy * ha_to_ev),
             "forces_ev_per_ang": (forces * ha_to_ev / bohr_to_ang).tolist(),
+            "mulliken_charges_e": [float(q) for q in mulliken_charges],
+            "dipole_debye": [float(d) for d in dipole_debye],
+            "homo_lumo_gap_ev": gap_ev,
             "symbols": symbols,
             "positions_ang": positions.tolist(),
             "n_atoms": len(atoms),
@@ -85,6 +104,10 @@ def run_single_dft(cluster_path, output_dir):
             "basis": BASIS,
             "time_s": elapsed,
         }
+
+        if gap_ev < 2.0:
+            result["status"] = "low_gap"
+            result["warning"] = f"HOMO-LUMO gap {gap_ev:.2f} eV below 2 eV threshold"
 
         with open(out_file, 'w') as f:
             json.dump(result, f)

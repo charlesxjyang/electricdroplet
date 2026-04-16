@@ -46,9 +46,15 @@ def extract_cluster(atoms, center_o_idx, cutoff_A):
     dists = np.linalg.norm(positions[o_indices] - center_pos, axis=1)
     nearby_o = [o_indices[j] for j, d in enumerate(dists) if d < cutoff_A]
 
-    # For each O, grab the two H that follow it (O, H, H ordering from build)
+    # For each O, grab the two H that follow it (O, H, H ordering from build).
+    # Fail loud if the invariant breaks — a silent reorder would poison the
+    # DFT training set with broken molecule geometries.
     cluster_indices = []
     for o in nearby_o:
+        assert o + 2 < len(symbols) and symbols[o+1] == 'H' and symbols[o+2] == 'H', (
+            f"O,H,H ordering broken at atom {o}: "
+            f"{symbols[o:o+3] if o+3 <= len(symbols) else symbols[o:]}"
+        )
         cluster_indices.extend([o, o+1, o+2])
 
     cluster = Atoms(

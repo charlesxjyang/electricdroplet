@@ -124,7 +124,7 @@ def run_single_dft(cluster_path, output_dir, functional=None, basis=None):
         with open(out_file, 'w') as f:
             json.dump(result, f)
 
-        return {"file": fname, "status": "ok", "time": elapsed,
+        return {"file": fname, "status": result["status"], "time": elapsed,
                 "energy_ev": result["energy_ev"]}
 
     except Exception as e:

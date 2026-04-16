@@ -123,7 +123,8 @@ def _fibonacci_sphere(n):
     """
     phi_golden = np.pi * (3.0 - np.sqrt(5.0))
     i = np.arange(n)
-    y = 1.0 - 2.0 * i / max(n - 1, 1)
+    # (i+0.5)/n keeps points off the exact poles — uniform solid-angle coverage.
+    y = 1.0 - 2.0 * (i + 0.5) / n
     r_xy = np.sqrt(np.clip(1 - y * y, 0.0, None))
     theta = phi_golden * i
     return np.stack([r_xy * np.cos(theta), y, r_xy * np.sin(theta)], axis=-1)

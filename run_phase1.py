@@ -71,13 +71,35 @@ def get_calc():
 
 
 def run(resume=False):
+    restored_conv = None
     if resume and RESTART.exists():
         print(f"Resuming from {RESTART}")
         atoms = read(str(RESTART))
         atoms.calc = get_calc()
-        meta = np.load(str(CKPT_META))
+        meta = np.load(str(CKPT_META), allow_pickle=True)
         start_step = int(meta['step'])
         print(f"  Resuming at step {start_step}")
+        # Restore convergence-tracking state so the samples buffer survives
+        # restarts. Without this, a restart mid-equilibration means we can't
+        # fire the convergence check until ~200 ps of fresh samples collect,
+        # delaying or missing the early-convergence decision.
+        if 'conv_samples' in meta.files:
+            try:
+                cs_item = meta['conv_converged_step'].item()
+                restored_conv = {
+                    'samples': list(meta['conv_samples']),
+                    'passes': int(meta['conv_passes']),
+                    'converged_step': int(cs_item) if cs_item is not None else None,
+                    'target_end': int(meta['conv_target_end']),
+                    'gng_fired': bool(meta['conv_gng_fired']),
+                }
+                print(f"  Restored convergence state: "
+                      f"{len(restored_conv['samples'])} samples, "
+                      f"{restored_conv['passes']} passes, "
+                      f"target_end={restored_conv['target_end']:,}")
+            except Exception as e:
+                print(f"  Warning: could not restore conv state ({e}); starting fresh")
+                restored_conv = None
     else:
         atoms = read("droplet_initial.xyz")
         atoms.calc = get_calc()
@@ -97,8 +119,8 @@ def run(resume=False):
     t0 = time.time()
     step_offset = start_step
 
-    # Convergence / early-termination state
-    conv = {
+    # Convergence / early-termination state (restored from checkpoint on resume)
+    conv = restored_conv or {
         'samples': [],          # list of {step, surf_cos, density, spread, T}
         'passes': 0,            # consecutive passing convergence checks
         'converged_step': None, # step at which equilibration was declared done
@@ -112,7 +134,18 @@ def run(resume=False):
     def checkpoint():
         step = step_offset + dyn.nsteps
         write(str(RESTART), atoms)
-        np.savez(str(CKPT_META), step=step)
+        np.savez(
+            str(CKPT_META),
+            step=step,
+            # Convergence state: persisting these means a mid-equilibration
+            # resume picks up with its full rolling buffer, so the next check
+            # fires on schedule instead of after another 200 ps of fresh data.
+            conv_samples=np.array(conv['samples'], dtype=object),
+            conv_passes=conv['passes'],
+            conv_converged_step=np.array(conv['converged_step'], dtype=object),
+            conv_target_end=conv['target_end'],
+            conv_gng_fired=conv['gng_fired'],
+        )
 
     def _measure():
         """Cheap per-step metrics for convergence tracking."""

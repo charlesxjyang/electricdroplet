@@ -44,7 +44,8 @@ CONV_PASSES_REQ    = 1        # passes required before declaring equilibrated
                               # deep inside tolerance with monotonic tightening)
 CONV_TOL_COS_THETA = 0.02     # |Δ<cos θ>_surface| between windows
 CONV_TOL_DENSITY   = 0.01     # |Δρ|/ρ (relative)
-CONV_TOL_SPREAD    = 0.01     # |Δ spread ratio|
+CONV_TOL_SPREAD    = 0.02     # |Δ spread ratio| — 3σ thermal noise floor
+                              # for 50-ps-averaged spread on a ~2100-water droplet
 
 
 class StopEarly(Exception):

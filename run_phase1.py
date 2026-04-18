@@ -442,9 +442,11 @@ def run_go_nogo_check(atoms, ns_per_day, equil_step=None):
     else:
         report.append(f"  [OK]   Temperature: {T:.1f} K")
 
-    if e_per_water > -0.1 or e_per_water < -1.0:
+    # MACE-MP-0 outputs absolute energies (not binding energies).
+    # Liquid water at 300K: ~-14.65 eV/water. Reasonable range: -16 to -13.
+    if e_per_water > -10.0 or e_per_water < -20.0:
         issues.append("ENERGY UNREASONABLE")
-        report.append(f"  [FAIL] Energy/water: {e_per_water:.4f} eV")
+        report.append(f"  [FAIL] Energy/water: {e_per_water:.4f} eV (expected ~-14.65 for MACE water)")
     else:
         report.append(f"  [OK]   Energy/water: {e_per_water:.4f} eV")
 
@@ -456,7 +458,10 @@ def run_go_nogo_check(atoms, ns_per_day, equil_step=None):
     else:
         report.append(f"  [OK]   Density: {density_nm3:.1f} mol/nm3 (bulk=33.4)")
 
-    expected_r = DIAMETER_NM * 10 / 2
+    # Derive expected radius from actual atom count, not DIAMETER_NM constant
+    # (which may be stale). rho_bulk = 33.4 mol/nm³ → V = N/rho → R = (3V/4π)^(1/3)
+    expected_vol_nm3 = n_water / 33.4
+    expected_r = (3 * expected_vol_nm3 / (4 * np.pi))**(1/3) * 10  # nm → Å
     r_deviation = abs(r90 - expected_r) / expected_r * 100
     report.append(f"         Effective radius: {r90:.1f} A (expected ~{expected_r:.0f} A, {r_deviation:.0f}% off)")
 

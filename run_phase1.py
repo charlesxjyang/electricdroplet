@@ -92,6 +92,7 @@ def run(resume=False):
                     'converged_step': int(cs_item) if cs_item is not None else None,
                     'target_end': int(meta['conv_target_end']),
                     'gng_fired': bool(meta['conv_gng_fired']),
+                    'last_check_step': int(meta['conv_last_check_step']) if 'conv_last_check_step' in meta.files else 0,
                 }
                 print(f"  Restored convergence state: "
                       f"{len(restored_conv['samples'])} samples, "
@@ -126,6 +127,7 @@ def run(resume=False):
         'converged_step': None, # step at which equilibration was declared done
         'target_end': TOTAL_STEPS,  # last step to run (may shrink on early conv)
         'gng_fired': False,     # whether go/no-go has been written
+        'last_check_step': 0,   # absolute step of last convergence check
     }
 
     def save_traj():
@@ -145,6 +147,7 @@ def run(resume=False):
             conv_converged_step=np.array(conv['converged_step'], dtype=object),
             conv_target_end=conv['target_end'],
             conv_gng_fired=conv['gng_fired'],
+            conv_last_check_step=conv.get('last_check_step', 0),
         )
 
     def _measure():
@@ -198,26 +201,30 @@ def run(resume=False):
                 'density': m['density'], 'spread': m['spread'], 'T': m['T'],
             })
 
+        # Convergence check at absolute-step intervals (not dyn.nsteps-relative,
+        # so it survives spot interruption → resume cycles without drifting).
+        if (conv['converged_step'] is None and
+                not conv['gng_fired'] and
+                step >= CONV_CHECK_START and
+                step - conv.get('last_check_step', 0) >= CONV_CHECK_STRIDE):
+            conv['last_check_step'] = step
+            _run_convergence_check(step)
+
         # Fallback: if we reach the 0.5 ns cap without early convergence,
         # fire go/no-go there (original behavior).
         if (not conv['gng_fired']) and step >= EQUIL_STEPS:
             conv['gng_fired'] = True
             conv['converged_step'] = step
-            # target_end already TOTAL_STEPS; keep production = 2 ns from here
             run_go_nogo_check(atoms, ns_per_day, equil_step=step)
 
         # Early termination when we've reached the (possibly shrunken) target
         if step >= conv['target_end']:
             raise StopEarly()
 
-    def check_convergence():
-        """Fires every CONV_CHECK_STRIDE. Declares early equilibration done
-        when all observables are stable across two consecutive 50-ps windows."""
-        step = step_offset + dyn.nsteps
-        if conv['gng_fired'] or conv['converged_step'] is not None:
-            return
-        if step < CONV_CHECK_START:
-            return
+    def _run_convergence_check(step):
+        """Called from status() at absolute-step intervals. Declares early
+        equilibration done when observables are stable across consecutive
+        50-ps windows."""
         samples = conv['samples']
         if len(samples) < 2 * CONV_WINDOW:
             return
@@ -263,7 +270,6 @@ def run(resume=False):
     dyn.attach(save_traj, interval=TRAJ_INT)
     dyn.attach(checkpoint, interval=CHECKPOINT_INT)
     dyn.attach(status, interval=LOG_INT)
-    dyn.attach(check_convergence, interval=CONV_CHECK_STRIDE)
 
     remaining = TOTAL_STEPS - start_step
     total_ns = TOTAL_STEPS * TIMESTEP_FS * 1e-6

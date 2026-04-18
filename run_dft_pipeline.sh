@@ -51,8 +51,28 @@ python -c "import pyscf" 2>/dev/null || {
     log "PySCF installed"
 }
 
-# ── Extract clusters from trajectory (stratified) ───────────────
+# ── Wait for enough production frames ───────────────────────────
+# Need at least N_TOTAL distinct production frames for statistical diversity.
+# At 0.03 ns/day = ~300 frames/day (TRAJ_INT=200, 0.1ps/frame), ~1 day wait.
 N_TOTAL=$((N_SURFACE + N_INTERFACE + N_BULK))
+MIN_PROD_FRAMES=$N_TOTAL
+
+log "Waiting for at least $MIN_PROD_FRAMES production frames in trajectory..."
+while true; do
+    N_TRAJ_FRAMES=$(python -c "from ase.io.trajectory import Trajectory; print(len(Trajectory('$TRAJ_FILE')))" 2>/dev/null || echo "0")
+    # Auto-detect equilibration frames from go/no-go report
+    EQUIL_NS=$(grep -oP 'Equilibration time:\s+\K[\d.]+' "$GO_NOGO_FILE" 2>/dev/null || echo "0.5")
+    EQUIL_FRAMES=$(python -c "print(int(float('$EQUIL_NS') * 1e3 / 0.1) + 100)")
+    PROD_FRAMES=$((N_TRAJ_FRAMES - EQUIL_FRAMES))
+    if [ "$PROD_FRAMES" -ge "$MIN_PROD_FRAMES" ] 2>/dev/null; then
+        log "  $PROD_FRAMES production frames available (need $MIN_PROD_FRAMES). Proceeding."
+        break
+    fi
+    log "  $PROD_FRAMES/$MIN_PROD_FRAMES production frames. Waiting 1h..."
+    sleep 3600
+done
+
+# ── Extract clusters from trajectory (stratified) ───────────────
 log "Extracting $N_TOTAL clusters (stratified: $N_SURFACE surface / $N_INTERFACE interface / $N_BULK bulk)..."
 python extract_clusters.py \
     --n-surface "$N_SURFACE" \

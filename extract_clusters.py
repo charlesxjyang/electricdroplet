@@ -28,7 +28,7 @@ from ase.io.trajectory import Trajectory
 from ase import Atoms
 
 TRAJ_FILE = Path("phase1/trajectory.traj")
-EQUIL_FRAMES = 10_000  # first 10K frames = 1ns equilibration, skip these
+EQUIL_FRAMES_DEFAULT = 2_500  # conservative default; override with --equil-frames
 OUTPUT_DIR = Path("clusters")
 
 # Stratum boundaries in Å, as inward offsets from r90
@@ -88,16 +88,31 @@ def _droplet_geometry(atoms):
     return com, r90
 
 
-def main(n_surface, n_interface, n_bulk, cutoff):
+def main(n_surface, n_interface, n_bulk, cutoff, equil_frames=None):
     OUTPUT_DIR.mkdir(exist_ok=True)
+
+    # Derive equilibration frame count from go/no-go if available
+    if equil_frames is None:
+        gng = Path("phase1/go_nogo_report.txt")
+        if gng.exists():
+            import re
+            text = gng.read_text()
+            m = re.search(r'Equilibration time:\s+([\d.]+)\s+ns', text)
+            if m:
+                equil_ns = float(m.group(1))
+                # TRAJ_INT=200 steps × TIMESTEP_FS=0.5 fs = 0.1 ps per frame
+                equil_frames = int(equil_ns * 1e3 / 0.1) + 100  # +100 buffer
+                print(f"  Derived equil_frames={equil_frames} from go/no-go ({equil_ns:.3f} ns)")
+        if equil_frames is None:
+            equil_frames = EQUIL_FRAMES_DEFAULT
 
     print(f"Loading trajectory from {TRAJ_FILE}...")
     traj = Trajectory(str(TRAJ_FILE))
     n_frames = len(traj)
     print(f"  Total frames: {n_frames}")
-    print(f"  Skipping first {EQUIL_FRAMES} (equilibration)")
+    print(f"  Skipping first {equil_frames} (equilibration)")
 
-    prod_frames = list(range(EQUIL_FRAMES, n_frames))
+    prod_frames = list(range(equil_frames, n_frames))
     if not prod_frames:
         raise SystemExit("No production frames available after equilibration skip.")
 
@@ -207,6 +222,9 @@ if __name__ == "__main__":
                         help="Clusters centered in the bulk core (r ≤ r90-8 Å)")
     parser.add_argument("--cutoff", type=float, default=6.0,
                         help="Cutoff radius in Angstrom for cluster extraction")
+    parser.add_argument("--equil-frames", type=int, default=None,
+                        help="Frames to skip as equilibration (auto-detected from "
+                             "go/no-go report if not specified)")
     args = parser.parse_args()
     main(n_surface=args.n_surface, n_interface=args.n_interface,
-         n_bulk=args.n_bulk, cutoff=args.cutoff)
+         n_bulk=args.n_bulk, cutoff=args.cutoff, equil_frames=args.equil_frames)

@@ -66,8 +66,15 @@ def run_single_dft(cluster_path, output_dir, functional=None, basis=None):
 
         # D3(BJ) dispersion correction
         if USE_D3:
-            from pyscf import dftd3
-            mf = dftd3.dftd3(mf)
+            try:
+                # simple-dftd3 (new, recommended): pip install dftd3
+                from dftd3.pyscf import DFTD3Dispersion
+                d3 = DFTD3Dispersion(mol, xc=xc)
+                mf = d3.to_scf(mf)
+            except ImportError:
+                # pyscf-dftd3 (old, deprecated)
+                from pyscf import dftd3
+                mf = dftd3.dftd3(mf)
 
         t0 = time.time()
         energy = mf.kernel()

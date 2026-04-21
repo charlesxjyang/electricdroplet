@@ -64,18 +64,6 @@ def run_single_dft(cluster_path, output_dir, functional=None, basis=None):
         mf.max_cycle = 200
         mf.conv_tol = 1e-7
 
-        # D3(BJ) dispersion correction
-        if USE_D3:
-            try:
-                # simple-dftd3 (new, recommended): pip install dftd3
-                from dftd3.pyscf import DFTD3Dispersion
-                d3 = DFTD3Dispersion(mol, xc=xc)
-                mf = d3.to_scf(mf)
-            except ImportError:
-                # pyscf-dftd3 (old, deprecated)
-                from pyscf import dftd3
-                mf = dftd3.dftd3(mf)
-
         t0 = time.time()
         energy = mf.kernel()
         elapsed = time.time() - t0
@@ -94,8 +82,20 @@ def run_single_dft(cluster_path, output_dir, functional=None, basis=None):
         gap_ev = (lumo - homo) * 27.211386245988
 
         # Analytical nuclear gradients -> forces
-        g = mf.nuc_grad_method().kernel()
-        forces = -g  # gradient -> force
+        g_dft = mf.nuc_grad_method().kernel()
+
+        # D3(BJ) dispersion (additive — doesn't change SCF density)
+        e_d3, g_d3 = 0.0, 0.0
+        if USE_D3:
+            try:
+                from dftd3.pyscf import DFTD3Dispersion
+                d3 = DFTD3Dispersion(mol, xc=xc)
+                e_d3, g_d3 = d3.kernel()
+            except ImportError:
+                pass  # skip D3 if neither package available
+
+        energy = energy + e_d3
+        forces = -(g_dft + g_d3)
 
         # Post-SCF quantities for PolarMACE cross-validation (Phase 1d):
         #   - Mulliken charges: per-atom, for direct comparison to PolarMACE

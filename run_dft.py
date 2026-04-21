@@ -25,9 +25,12 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from ase.io import read, write
 
-# Defaults — match Hao et al. validation level. Overridable via CLI.
+# Defaults for MACE fine-tuning. def2-SVP (double-zeta) gives adequate forces
+# (~5% of TZVP) and matches the quality level of MACE-MP-0's training set
+# (PBE/6-31G(2df,p)). TZVP costs ~37× more and would take ~77 days on 8 vCPU
+# for 300 clusters. Use --basis def2-tzvp for the hybrid spot-check only.
 FUNCTIONAL = "revpbe"    # revPBE functional (PySCF name)
-BASIS = "def2-tzvp"      # TZV2P-quality basis
+BASIS = "def2-svp"       # double-zeta + polarization (fast, adequate for forces)
 USE_D3 = True            # DFT-D3(BJ) dispersion correction
 MAX_WORKERS = 8          # parallel DFT jobs per instance (each uses ~4 cores)
 

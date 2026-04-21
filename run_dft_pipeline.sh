@@ -94,7 +94,7 @@ export OMP_NUM_THREADS=4
 N_WORKERS=2
 
 log "Starting DFT primary pass: $N_EXTRACTED clusters, $N_WORKERS parallel workers, $OMP_NUM_THREADS threads each"
-log "Functional: revPBE-D3 / def2-TZVP (matches Hao et al.)"
+log "Functional: revPBE-D3 / def2-SVP (adequate for MACE fine-tuning forces)"
 
 python run_dft.py \
     --clusters-dir "$CLUSTERS_DIR" \
@@ -110,11 +110,12 @@ log "Primary DFT complete: $N_OK/$N_DONE converged"
 # surface clusters to bound cost while quantifying the functional error
 # on the physics that matters for the paper.
 log ""
-log "Starting hybrid spot-check: $N_HYBRID_SPOTCHECK surface clusters at revPBE0-D3"
+log "Starting hybrid spot-check: $N_HYBRID_SPOTCHECK surface clusters at revPBE0-D3/def2-TZVP"
 python run_dft.py \
     --clusters-dir "$CLUSTERS_DIR" \
     --output-dir "$DFT_HYBRID_DIR" \
     --functional revpbe0 \
+    --basis def2-tzvp \
     --filter '*_surface.xyz' \
     --end "$N_HYBRID_SPOTCHECK" \
     --workers "$N_WORKERS" 2>&1

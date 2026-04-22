@@ -66,8 +66,12 @@ def compute_efield(atoms, com, bin_edges):
         for pi, p in enumerate(probes_m):
             dr = p - positions_m
             r = np.linalg.norm(dr, axis=1)
-            r = np.maximum(r, 1e-12)
-            e_vec = K_COULOMB * charges_C[:, None] * dr / (r[:, None] ** 3)
+            # Exclude atoms within 1 Å of probe — point-charge Coulomb
+            # diverges at short range where the electron density is spread out
+            mask = r > 1.0 * ANGSTROM_TO_M
+            if mask.sum() == 0:
+                continue
+            e_vec = K_COULOMB * charges_C[mask, None] * dr[mask] / (r[mask, None] ** 3)
             shell_fields[pi] = np.linalg.norm(e_vec.sum(axis=0))
 
         field_mag[bi] = shell_fields.mean()

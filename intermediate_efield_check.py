@@ -45,7 +45,13 @@ def _fibonacci_sphere(n):
 
 
 def compute_efield(atoms, com, bin_edges):
-    """Fixed-charge Coulomb E-field at radial shells."""
+    """Radial component of fixed-charge Coulomb E-field at radial shells.
+
+    Computes E·r̂ (signed radial field, positive = outward) averaged over
+    Fibonacci-spiral probe points on each shell. This is the quantity Hao
+    et al. report — NOT |E| (magnitude), which is always ~100s of MV/cm
+    due to molecular granularity and doesn't reveal the surface enhancement.
+    """
     symbols = atoms.get_chemical_symbols()
     charges_e = np.array([Q_O if s == 'O' else Q_H for s in symbols])
     positions_m = atoms.positions * ANGSTROM_TO_M
@@ -53,7 +59,7 @@ def compute_efield(atoms, com, bin_edges):
     charges_C = charges_e * E_CHARGE_C
 
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    field_mag = np.zeros(len(bin_centers))
+    field_radial = np.zeros(len(bin_centers))
     unit_probes = _fibonacci_sphere(N_PROBES)
 
     for bi, r_A in enumerate(bin_centers):
@@ -66,17 +72,18 @@ def compute_efield(atoms, com, bin_edges):
         for pi, p in enumerate(probes_m):
             dr = p - positions_m
             r = np.linalg.norm(dr, axis=1)
-            # Exclude atoms within 1 Å of probe — point-charge Coulomb
-            # diverges at short range where the electron density is spread out
             mask = r > 1.0 * ANGSTROM_TO_M
             if mask.sum() == 0:
                 continue
             e_vec = K_COULOMB * charges_C[mask, None] * dr[mask] / (r[mask, None] ** 3)
-            shell_fields[pi] = np.linalg.norm(e_vec.sum(axis=0))
+            E_total = e_vec.sum(axis=0)
+            # Radial component: project onto outward unit vector from COM
+            r_hat = (p - com_m) / np.linalg.norm(p - com_m)
+            shell_fields[pi] = np.dot(E_total, r_hat)
 
-        field_mag[bi] = shell_fields.mean()
+        field_radial[bi] = shell_fields.mean()
 
-    return bin_centers, field_mag * VM_TO_MVCM
+    return bin_centers, field_radial * VM_TO_MVCM
 
 
 def get_equil_frames():

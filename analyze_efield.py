@@ -132,18 +132,22 @@ def _fibonacci_sphere(n):
 
 def compute_efield_radial(atoms, charges_e, com, bin_edges, n_probes=50):
     """
-    Compute radially-averaged E-field magnitude from point charges.
+    Compute radial component of Coulomb E-field from point charges.
 
     For each radial shell, place Fibonacci-spiral probe points on a sphere
-    and compute the Coulomb E-field from all atomic charges. Returns field
-    in V/m.
+    and compute E·r̂ (signed radial field, positive = outward from COM).
+    This is the quantity Hao et al. report — NOT |E| (magnitude), which
+    is always hundreds of MV/cm due to molecular granularity and doesn't
+    reveal the surface enhancement signal.
+
+    Returns field in V/m.
     """
     positions_m = atoms.positions * ANGSTROM_TO_M
     com_m = com * ANGSTROM_TO_M
     charges_C = charges_e * E_CHARGE_C
 
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    field_mag = np.zeros(len(bin_centers))
+    field_radial = np.zeros(len(bin_centers))
 
     unit_probes = _fibonacci_sphere(n_probes)  # shape (n_probes, 3)
 
@@ -157,17 +161,17 @@ def compute_efield_radial(atoms, charges_e, com, bin_edges, n_probes=50):
         for pi, p in enumerate(probes_m):
             dr = p - positions_m
             r = np.linalg.norm(dr, axis=1)
-            # Exclude atoms within 1 Å of probe — point-charge Coulomb
-            # diverges at short range where electron density is spread out.
             mask = r > 1.0 * ANGSTROM_TO_M
             if mask.sum() == 0:
                 continue
             e_vec = K_COULOMB * charges_C[mask, None] * dr[mask] / (r[mask, None] ** 3)
-            shell_fields[pi] = np.linalg.norm(e_vec.sum(axis=0))
+            E_total = e_vec.sum(axis=0)
+            r_hat = (p - com_m) / np.linalg.norm(p - com_m)
+            shell_fields[pi] = np.dot(E_total, r_hat)
 
-        field_mag[bi] = shell_fields.mean()
+        field_radial[bi] = shell_fields.mean()
 
-    return bin_centers, field_mag
+    return bin_centers, field_radial
 
 
 def compute_density_profile(atoms, com, bin_edges):

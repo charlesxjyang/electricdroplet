@@ -19,6 +19,16 @@ droplet_initial.xyz
 # Analysis outputs
 analysis/
 
+# Paper drafts (keep out of repo)
+paper/drafts/
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.synctex.gz
+paper/*.out
+
 # Python
 __pycache__/
 *.pyc

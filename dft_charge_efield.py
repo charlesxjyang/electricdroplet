@@ -155,10 +155,12 @@ def main(n_frames=20):
     r90 = float(np.percentile(np.linalg.norm(o_pos - o_pos.mean(axis=0), axis=1), 90))
     bin_edges = np.linspace(0, r90 + 10, 41)
 
-    print("\nComputing E-field from 3 charge models on {} frames...".format(n_frames))
+    print("\nComputing E-field from multiple charge models on {} frames...".format(n_frames))
 
     all_ef_fixed = []
     all_ef_dft = []
+    extra_results = []
+    traj_cache = {}
     t0 = time.time()
 
     for k, fi in enumerate(frame_list):
@@ -199,23 +201,79 @@ def main(n_frames=20):
     enhs_f = [(np.mean(ef[surface] * VM) - np.mean(ef[bulk] * VM)) for ef in all_ef_fixed]
     enhs_d = [(np.mean(ef[surface] * VM) - np.mean(ef[bulk] * VM)) for ef in all_ef_dft]
 
+    # Also try Lowdin/Becke charges if recompute_charges has been run
+    recharge_dir = Path("dft_charges")
+    for method in ["lowdin", "becke"]:
+        charge_files = sorted(recharge_dir.glob("*_charges.json")) if recharge_dir.exists() else []
+        if not charge_files:
+            continue
+
+        # Build stratum-averaged charges for this method
+        method_charges = {"surface": {"O": [], "H": []},
+                          "interface": {"O": [], "H": []},
+                          "bulk": {"O": [], "H": []}}
+        import csv
+        strata = {}
+        if MANIFEST.exists():
+            with open(MANIFEST) as f:
+                for row in csv.DictReader(f):
+                    strata[row["filename"].replace(".xyz", "")] = row["stratum"]
+
+        for jf in charge_files:
+            with open(jf) as f:
+                d = json.load(f)
+            name = jf.stem.replace("_charges", "")
+            stratum = strata.get(name)
+            if stratum not in method_charges or "{}_charges".format(method) not in d:
+                continue
+            for s, q in zip(d["symbols"], d["{}_charges".format(method)]):
+                if s in ("O", "H"):
+                    method_charges[stratum][s].append(q)
+
+        if all(method_charges[s]["O"] for s in method_charges):
+            method_dft = {s: {"O": float(np.mean(v["O"])), "H": float(np.mean(v["H"]))}
+                          for s, v in method_charges.items() if v["O"]}
+
+            all_ef_method = []
+            for fi in frame_list:
+                atoms = traj_cache[fi] if fi in traj_cache else traj[fi]
+                pos = atoms.positions
+                sym = atoms.get_chemical_symbols()
+                o_pos_f = pos[[i for i, s in enumerate(sym) if s == "O"]]
+                com = o_pos_f.mean(axis=0)
+                q_m = assign_dft_charges(atoms, com, r90, method_dft)
+                _, ef_m = compute_efield_radial(atoms, q_m, com, bin_edges)
+                all_ef_method.append(ef_m)
+
+            ef_m_mean = np.mean(all_ef_method, axis=0) * VM
+            sm = float(ef_m_mean[surface].mean())
+            bm = float(ef_m_mean[bulk].mean())
+            enhs_m = [(np.mean(ef[surface] * VM) - np.mean(ef[bulk] * VM)) for ef in all_ef_method]
+            extra_results.append((method.capitalize(), bm, sm, sm - bm,
+                                  np.std(enhs_m) / np.sqrt(len(enhs_m))))
+
     print("\n" + "=" * 60)
-    print("RESULTS: DFT vs SPC/E vs PolarMACE E-field ({} frames)".format(n_frames))
+    print("RESULTS: Multi-method E-field comparison ({} frames)".format(n_frames))
     print("=" * 60)
     print("Fixed SPC/E:     bulk={:+.2f}  surface={:+.2f}  enh={:+.2f} +/- {:.2f} MV/cm".format(
         bf, sf, sf - bf, np.std(enhs_f) / np.sqrt(len(enhs_f))))
     print("DFT Mulliken:    bulk={:+.2f}  surface={:+.2f}  enh={:+.2f} +/- {:.2f} MV/cm".format(
         bd, sd, sd - bd, np.std(enhs_d) / np.sqrt(len(enhs_d))))
+    for name, b, s, enh, err in extra_results:
+        print("DFT {:12s} bulk={:+.2f}  surface={:+.2f}  enh={:+.2f} +/- {:.2f} MV/cm".format(
+            name + ":", b, s, enh, err))
     print("PolarMACE:       enh=-9.96 +/- 0.96 MV/cm (prior full-droplet run)")
     print("Hao et al C-GeM: enh=+9 MV/cm")
     print("")
 
-    if (sd - bd) < 0:
-        print("DFT charges give NEGATIVE enhancement → sign is a DFT-level prediction,")
-        print("not a PolarMACE artifact. Consistent with DFT slab calculations.")
+    all_enh = [sf - bf, sd - bd] + [x[3] for x in extra_results]
+    if all(e < 0 for e in all_enh):
+        print("ALL charge methods give NEGATIVE enhancement → sign is robust")
+        print("across DFT charge partitions. Not a PolarMACE artifact.")
+    elif all(e > 0 for e in all_enh):
+        print("ALL charge methods give POSITIVE enhancement → agrees with C-GeM.")
     else:
-        print("DFT charges give POSITIVE enhancement → PolarMACE may have a systematic")
-        print("bias. C-GeM sign may be correct.")
+        print("MIXED signs across methods → sign depends on charge partition.")
 
 
 if __name__ == "__main__":
